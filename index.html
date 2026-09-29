@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Aetherward: Skyborne Sigils — 2D Arcane Gesture Defense</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <!-- Hidden Video Element for Local In-Browser Webcam Hand Tracking -->
+  <video id="camera-hidden-video" class="hidden" playsinline muted></video>
+
+  <!-- Fullscreen Interactive Game Canvas -->
+  <canvas id="game-canvas" aria-label="Aetherward Skyborne Sigils Game Canvas"></canvas>
+
+  <!-- ======================================================================
+       1. MAIN MENU SCREEN
+       ====================================================================== -->
+  <section id="screen-menu" class="overlay-screen">
+    <div class="menu-card">
+      <span class="game-badge">✨ Arcane Spire Defense ✨</span>
+      <h1 class="game-title">Aetherward:<br />Skyborne Sigils</h1>
+      <p class="game-subtitle">Draw enchanted runes in the sky to pop the Gloomflotilla's balloons before they breach the courtyard!</p>
+
+      <!-- Step 1: Game Mode Selector -->
+      <div class="selector-section-label">1. Choose Game Mode</div>
+      <div class="mode-selector" role="group" aria-label="Select Game Mode">
+        <button type="button" class="mode-btn active js-select-mode" data-mode="endless">
+          <strong>♾️ Endless</strong>
+          <span>Progressive Survival</span>
+        </button>
+        <button type="button" class="mode-btn js-select-mode" data-mode="rush">
+          <strong>⚡ Rush Mode</strong>
+          <span>90s + Overtime Arcade</span>
+        </button>
+        <button type="button" class="mode-btn js-select-mode" data-mode="daily">
+          <strong>📅 Daily Trial</strong>
+          <span>Today's Seeded Run</span>
+        </button>
+      </div>
+
+      <!-- Step 2: Control Method Selector (Standard vs Camera / Finger Tracking) -->
+      <div class="selector-section-label">2. Control Method</div>
+      <div class="control-selector" role="group" aria-label="Select Control Method">
+        <button type="button" class="mode-btn active js-select-control" data-control="standard">
+          <strong>🖱️ Standard</strong>
+          <span>Mouse / Touch Screen</span>
+        </button>
+        <button type="button" class="mode-btn js-select-control" data-control="camera">
+          <strong>📷 Camera Control</strong>
+          <span>Index Finger Tracking</span>
+        </button>
+      </div>
+
+      <div class="menu-best-banner">
+        🏆 Mode High Score: <span id="menu-best-score">0</span>
+      </div>
+
+      <div class="menu-actions">
+        <button type="button" id="btn-start-game" class="btn btn-primary">
+          🪄 Start Defense
+        </button>
+        <div class="menu-secondary-row">
+          <button type="button" id="btn-open-rush-leaderboard" class="btn btn-arcade">
+            🏆 Rush Records
+          </button>
+          <button type="button" id="btn-open-grimoire" class="btn btn-secondary">
+            📖 How to Play
+          </button>
+        </div>
+        <div class="menu-secondary-row">
+          <button type="button" id="btn-open-scores" class="btn btn-secondary">
+            🏅 All Stats &amp; Honors
+          </button>
+          <button type="button" id="btn-open-settings" class="btn btn-secondary">
+            ⚙️ Settings
+          </button>
+        </div>
+        <button type="button" class="btn btn-secondary js-toggle-mute" aria-pressed="true">
+          🔊 Audio On
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================================
+       2. IN-GAME HEADS-UP DISPLAY (HUD)
+       ====================================================================== -->
+  <section id="screen-hud" class="hidden" aria-live="polite">
+    <div>
+      <div class="hud-top-bar">
+        <!-- Left: Score, High Score & Combo -->
+        <div class="hud-group">
+          <div class="hud-pill">
+            <span class="hud-label">Score</span>
+            <span id="hud-score" class="hud-value gold">0</span>
+          </div>
+          <div class="hud-pill">
+            <span class="hud-label">High Score</span>
+            <span id="hud-best" class="hud-value">0</span>
+          </div>
+          <div id="hud-combo-badge" class="hud-pill combo-pill inactive">
+            <span class="hud-label">Combo Multiplier</span>
+            <span id="hud-combo-value" class="hud-value">1x</span>
+            <div class="combo-bar-track">
+              <div id="hud-combo-bar"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Center: Survival Timer & Current Difficulty Phase -->
+        <div class="hud-group">
+          <div id="hud-timer-pill" class="hud-pill" style="text-align:center;">
+            <span id="hud-phase" class="hud-label">Phase I: Dawn Breeze</span>
+            <span id="hud-time" class="hud-value">00:00</span>
+          </div>
+        </div>
+
+        <!-- Right: Ward Crystals (Lives) & Pause -->
+        <div class="hud-group">
+          <div class="hud-pill">
+            <span class="hud-label">Spire Wards</span>
+            <div id="hud-lives" class="lives-container" aria-label="Remaining Lives"></div>
+          </div>
+          <button type="button" class="hud-btn js-toggle-mute" title="Toggle Audio">🔊</button>
+          <button type="button" id="btn-pause" class="hud-btn" title="Pause Game (Esc or P)">⏸️ Pause</button>
+        </div>
+      </div>
+
+      <!-- Dynamic Wave / Boss Banner, Hand-Lost Alert & Recognition Pill -->
+      <div class="hud-center-alerts">
+        <div id="hud-hand-lost-banner" class="hand-lost-banner hidden">
+          <strong>🖐️ HAND LOST — SHOW YOUR HAND</strong>
+          <span>Hold your index finger in front of the camera to resume casting</span>
+        </div>
+        <div id="hud-wave-banner" class="wave-banner hidden">
+          <h2 id="hud-banner-title">Phase I: Dawn Breeze</h2>
+          <p id="hud-banner-sub">Draw the runes to pop the balloons!</p>
+        </div>
+        <div id="hud-recognition-pill" class="recognition-pill hidden">✓ Solar Orb</div>
+      </div>
+    </div>
+
+    <!-- Bottom HUD: Camera PiP Monitor, Active Power-Up Timers & Ultimate Meter -->
+    <div class="hud-bottom-bar">
+      <div style="display:flex; align-items:flex-end; gap:12px;">
+        <!-- Optional Camera Tracking Picture-in-Picture Widget -->
+        <div id="hud-camera-pip" class="camera-pip-widget hidden">
+          <div class="pip-header">
+            <div class="pip-status">
+              <span id="pip-state-dot" class="pip-dot"></span>
+              <span id="pip-confidence-text">TRACKING</span>
+            </div>
+            <div class="pip-controls">
+              <button type="button" id="btn-pip-toggle-video" class="pip-mini-btn active" title="Toggle Webcam Video Preview">📷</button>
+              <button type="button" id="btn-pip-toggle-skeleton" class="pip-mini-btn active" title="Toggle Tracking Preview Box">👁️</button>
+            </div>
+          </div>
+          <canvas id="camera-pip-canvas" width="176" height="132"></canvas>
+        </div>
+
+        <div id="hud-active-powerups" class="active-powerups-row"></div>
+      </div>
+
+      <button type="button" id="btn-ultimate" class="ultimate-btn" disabled title="Unleash Astral Cataclysm (Space)">
+        <div id="ultimate-meter-fill"></div>
+        <span>⚡ Arcane Surge</span>
+        <span id="ultimate-meter-pct">0%</span>
+      </button>
+    </div>
+  </section>
+
+  <!-- ======================================================================
+       3. CAMERA SETUP, HAND DETECTION & CALIBRATION MODAL
+       ====================================================================== -->
+  <div id="modal-camera-setup" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="camera-setup-headline">
+    <div class="modal-window arcade-cabinet-window" style="max-width: 580px; text-align: center;">
+      <span id="camera-setup-stage-badge" class="game-badge arcade-badge">STEP 1 OF 3 • CAMERA SETUP</span>
+      <h2 id="camera-setup-headline" class="arcade-title" style="font-size: 1.7rem; margin-top: 6px;">
+        SHOW YOUR HAND TO THE CAMERA
+      </h2>
+      <p id="camera-setup-subtext" class="arcade-subtext" style="margin-bottom: 14px;">
+        Point your index finger in front of the webcam to calibrate arcane air-drawing.
+      </p>
+
+      <!-- Progress Bar -->
+      <div class="camera-progress-track">
+        <div id="camera-setup-progress-fill" class="camera-progress-fill"></div>
+      </div>
+
+      <!-- Live Mirrored Webcam & Calibration Viewport -->
+      <div class="camera-setup-viewport">
+        <canvas id="camera-setup-canvas" width="480" height="360"></canvas>
+        <div id="camera-countdown-overlay" class="camera-countdown-overlay hidden">3</div>
+      </div>
+
+      <div class="camera-privacy-note">
+        🔒 <strong>Privacy Guaranteed:</strong> Camera tracking runs 100% locally in your browser. No video is ever recorded or uploaded.
+        <br />
+        💡 <strong>How to Draw in Air:</strong> <strong>☝️ Open Index Finger</strong> to draw → <strong>✊ Close Hand into a Fist</strong> to submit → <strong>☝️ Open Index Finger</strong> for the next symbol!
+      </div>
+
+      <div class="menu-secondary-row" style="margin-top: 14px;">
+        <button type="button" id="btn-cancel-camera-setup" class="btn btn-secondary">
+          ✕ Cancel
+        </button>
+        <button type="button" id="btn-skip-calibration" class="btn btn-arcade hidden">
+          ⚡ Skip to Countdown
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       4. RUSH MODE: ENTER YOUR NAME MODAL (Pre-Game Arcade Prompt)
+       ====================================================================== -->
+  <div id="modal-rush-name" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="rush-name-title">
+    <div class="modal-window narrow arcade-cabinet-window">
+      <div class="arcade-header-center">
+        <span class="game-badge arcade-badge">⚡ RUSH MODE CHALLENGER ⚡</span>
+        <h2 id="rush-name-title" class="arcade-title">ENTER YOUR NAME</h2>
+        <p class="arcade-subtext">Survive the 90s Rush to unlock <strong>OVERTIME (OT)</strong> and etch your name into the Top Players leaderboard!</p>
+      </div>
+
+      <form id="form-rush-name" class="arcade-name-form" autocomplete="off">
+        <label for="input-rush-player-name" class="arcade-input-label">CHALLENGER TAG (3–12 CHARS)</label>
+        <input
+          type="text"
+          id="input-rush-player-name"
+          class="arcade-name-input"
+          maxlength="12"
+          placeholder="PLAYER"
+          aria-label="Enter Player Name"
+        />
+        <small class="arcade-input-hint">Leave blank to play as <strong>PLAYER</strong>. Your name is remembered automatically.</small>
+
+        <div class="menu-actions" style="margin-top: 18px;">
+          <button type="submit" id="btn-confirm-rush-start" class="btn btn-primary">
+            ⚡ START RUSH MODE
+          </button>
+          <button type="button" id="btn-rush-menu-leaderboard" class="btn btn-arcade">
+            🏆 VIEW RUSH LEADERBOARD
+          </button>
+          <button type="button" class="btn btn-secondary js-close-modal" data-modal="rushName">
+            ✕ Cancel
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       5. RUSH MODE ARCADE LEADERBOARD MODAL
+       ====================================================================== -->
+  <div id="modal-rush-leaderboard" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="rush-lb-title">
+    <div class="modal-window arcade-cabinet-window">
+      <div class="modal-header">
+        <div>
+          <span class="game-badge arcade-badge" style="margin-bottom:4px;">⚡ TOP PLAYERS ⚡</span>
+          <h2 id="rush-lb-title" class="arcade-title" style="font-size:1.55rem;">RUSH MODE LEADERBOARD</h2>
+        </div>
+        <button type="button" class="btn btn-secondary js-close-modal" data-modal="rushLeaderboard">✕ Close</button>
+      </div>
+
+      <!-- Top Summary Banner -->
+      <div class="rush-summary-strip">
+        <div class="rush-summary-item">
+          <span>🏆 HIGH SCORE</span>
+          <strong id="rush-lb-top-score">0</strong>
+        </div>
+        <div class="rush-summary-item">
+          <span>⏱️ BEST OVERTIME</span>
+          <strong id="rush-lb-best-ot">OT 00:00</strong>
+        </div>
+        <div class="rush-summary-item">
+          <span>🕹️ RECORDS SAVED</span>
+          <strong id="rush-lb-count">0 / 20</strong>
+        </div>
+      </div>
+
+      <!-- Arcade High-Score Table -->
+      <div class="arcade-table-container">
+        <table class="arcade-leaderboard-table" aria-label="Rush Mode High Scores">
+          <thead>
+            <tr>
+              <th>RANK</th>
+              <th>NAME</th>
+              <th>SCORE</th>
+              <th>OVERTIME</th>
+            </tr>
+          </thead>
+          <tbody id="rush-leaderboard-tbody">
+            <!-- Populated dynamically by js/ui.js -->
+          </tbody>
+        </table>
+        <div id="rush-leaderboard-empty" class="arcade-empty-state hidden">
+          No Rush Mode records yet! Enter your name and play Rush Mode to set the #1 Record!
+        </div>
+      </div>
+
+      <!-- Selected Record Inspector Panel -->
+      <div id="rush-record-inspector" class="arcade-record-inspector hidden">
+        <div class="inspector-header">
+          <strong id="inspector-title">RECORD DETAILS — #1 DAVID</strong>
+          <span id="inspector-date" class="inspector-date">2026-09-28</span>
+        </div>
+        <div class="inspector-stats-row">
+          <div><span>Score</span><strong id="inspector-score">0</strong></div>
+          <div><span>Overtime</span><strong id="inspector-ot">OT 00:00</strong></div>
+          <div><span>Total Match Time</span><strong id="inspector-total-time">00:00</strong></div>
+          <div><span>Highest Combo</span><strong id="inspector-combo">0x</strong></div>
+          <div><span>Accuracy</span><strong id="inspector-accuracy">100%</strong></div>
+        </div>
+      </div>
+
+      <!-- Footer Actions -->
+      <div class="rush-lb-footer">
+        <button type="button" id="btn-open-clear-rush-confirm" class="btn btn-danger-outline">
+          🗑️ CLEAR LEADERBOARD
+        </button>
+        <button type="button" id="btn-rush-lb-play" class="btn btn-primary">
+          ⚡ Play Rush Mode
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       6. CONFIRM CLEAR RUSH LEADERBOARD DIALOG
+       ====================================================================== -->
+  <div id="modal-confirm-clear-rush" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="clear-rush-title">
+    <div class="modal-window narrow arcade-confirm-window" style="text-align:center;">
+      <div class="confirm-warning-icon">⚠️</div>
+      <h2 id="clear-rush-title" style="font-family:var(--font-display); font-size:1.55rem; color:var(--danger); margin-bottom:8px;">
+        Clear all Rush Mode records?
+      </h2>
+      <p style="color:var(--text-muted); font-size:0.94rem; line-height:1.5; margin-bottom:22px;">
+        This action cannot be undone. All saved Rush Mode scores, Rush high-score records, and overtime survival records will be permanently erased.
+      </p>
+      <div class="menu-secondary-row">
+        <button type="button" id="btn-cancel-clear-rush" class="btn btn-secondary">
+          CANCEL
+        </button>
+        <button type="button" id="btn-confirm-clear-rush" class="btn btn-danger">
+          CLEAR
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       7. HOW TO PLAY & INTERACTIVE RUNE GRIMOIRE MODAL
+       ====================================================================== -->
+  <div id="modal-grimoire" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-window">
+      <div class="modal-header">
+        <h2>📖 Runekeeper's Grimoire &amp; Practice Pad</h2>
+        <button type="button" class="btn btn-secondary js-close-modal" data-modal="grimoire">✕ Close</button>
+      </div>
+
+      <div class="grimoire-intro">
+        <div class="grimoire-rules">
+          <p><strong>🎯 Core Mechanic:</strong> Draw the rune shown on an enemy's balloon using your mouse, touchscreen, or <strong>📷 Camera Finger Tracking</strong>!</p>
+          <p><strong>🖐️ Camera Air-Drawing:</strong> In Camera Mode, point your index finger and move it in the air to trace a rune. Pause briefly at the end of the shape (or curl your finger) to cast!</p>
+          <p><strong>⚡ Multi-Cast &amp; Combos:</strong> If multiple enemies share the same rune, one drawing pops <em>all</em> of them simultaneously for a massive Multi-Cast bonus!</p>
+          <p><strong>🔒 Ordered &amp; Decoy Balloons:</strong> Pop numbered balloons in order (start with <strong>#1</strong>), and ignore the dashed flickering decoy balloon on <em>Mirror Tricksters</em>!</p>
+        </div>
+
+        <!-- Live Interactive Practice Canvas -->
+        <div class="practice-pad-box">
+          <h4>🪄 Test-Draw Any Rune Here:</h4>
+          <canvas id="practice-canvas" width="220" height="165"></canvas>
+          <div id="practice-result">Draw a shape above to test recognition!</div>
+        </div>
+      </div>
+
+      <div id="grimoire-symbol-grid"></div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       8. GENERAL HIGH SCORES & ACHIEVEMENTS MODAL
+       ====================================================================== -->
+  <div id="modal-scores" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-window">
+      <div class="modal-header">
+        <h2>🏅 Hall of Records &amp; Achievements</h2>
+        <button type="button" class="btn btn-secondary js-close-modal" data-modal="scores">✕ Close</button>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-box">
+          <span>♾️ Endless Best Score</span>
+          <strong id="score-endless">0</strong>
+        </div>
+        <div class="stat-box">
+          <span>⚡ Rush Mode High Score</span>
+          <strong id="score-rush">0</strong>
+        </div>
+        <div class="stat-box">
+          <span>📅 Today's Daily Trial Best</span>
+          <strong id="score-daily">0</strong>
+        </div>
+        <div class="stat-box">
+          <span>🔥 Highest Combo / Total Defeated</span>
+          <strong><span id="stat-best-combo">0x</span> / <span id="stat-total-defeated">0</span></strong>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 18px; text-align: center;">
+        <button type="button" id="btn-scores-open-rush-lb" class="btn btn-arcade" style="width:100%;">
+          🏆 OPEN RUSH MODE ARCADE LEADERBOARD
+        </button>
+      </div>
+
+      <h3 style="font-family:var(--font-display); color:var(--gold-bright); margin-bottom:8px;">Unlocked Honors</h3>
+      <div id="achievements-list" class="achievements-grid"></div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       9. SETTINGS MODAL
+       ====================================================================== -->
+  <div id="modal-settings" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-window narrow">
+      <div class="modal-header">
+        <h2>⚙️ Arcane Settings</h2>
+        <button type="button" class="btn btn-secondary js-close-modal" data-modal="settings">✕ Close</button>
+      </div>
+
+      <div class="settings-list">
+        <div class="setting-row">
+          <label for="setting-sfx">
+            Sound Effects (SFX)
+            <small>Balloon pops, spell chimes, and combat alerts</small>
+          </label>
+          <input type="checkbox" id="setting-sfx" checked />
+        </div>
+
+        <div class="setting-row">
+          <label for="setting-music">
+            Adaptive Background Music
+            <small>Dynamic synth soundtrack that intensifies with waves</small>
+          </label>
+          <input type="checkbox" id="setting-music" checked />
+        </div>
+
+        <div class="setting-row">
+          <label for="setting-volume">
+            Master Volume
+          </label>
+          <input type="range" id="setting-volume" min="0" max="1" step="0.05" value="0.75" />
+        </div>
+
+        <div class="setting-row">
+          <label for="setting-forgiving">
+            Extra-Forgiving Recognition
+            <small>Increases gesture tolerance for fast or camera play</small>
+          </label>
+          <input type="checkbox" id="setting-forgiving" />
+        </div>
+
+        <div class="setting-row">
+          <label for="setting-cam-pause-lost">
+            Camera: Pause Enemies if Hand Lost
+            <small>Prevents unfair hits if your hand leaves the webcam frame</small>
+          </label>
+          <input type="checkbox" id="setting-cam-pause-lost" checked />
+        </div>
+
+        <div class="setting-row">
+          <label for="setting-cam-gesture">
+            Camera Air-Draw Trigger
+            <small>How to start and finalize symbols in the air</small>
+          </label>
+          <select id="setting-cam-gesture">
+            <option value="point_dwell">Open Index → Draw → Close Fist (Default)</option>
+            <option value="pinch">Thumb-Index Pinch</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <label for="setting-reduced-fx">
+            Reduced Screen Shake &amp; Flashes
+            <small>Accessibility mode with calmer visual effects</small>
+          </label>
+          <input type="checkbox" id="setting-reduced-fx" />
+        </div>
+
+        <div class="setting-row">
+          <label for="setting-theme">
+            Sky Realm Theme
+            <small>Override sky colors or use phase-shifting skies</small>
+          </label>
+          <select id="setting-theme">
+            <option value="dynamic">Dynamic Sky (Default)</option>
+            <option value="starlight">Starlight Observatory</option>
+            <option value="emerald">Enchanted Canopy</option>
+            <option value="crimson">Blood Moon Spire</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       10. PAUSE MENU MODAL
+       ====================================================================== -->
+  <div id="modal-pause" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-window narrow" style="text-align:center;">
+      <h2 style="font-family:var(--font-display); font-size:1.8rem; color:var(--gold-bright); margin-bottom:18px;">⏸️ Defense Paused</h2>
+      <div class="menu-actions">
+        <button type="button" id="btn-resume" class="btn btn-primary">▶️ Resume Game</button>
+        <button type="button" id="btn-pause-grimoire" class="btn btn-secondary">📖 View Rune Grimoire</button>
+        <button type="button" id="btn-restart-pause" class="btn btn-secondary">🔄 Restart Run</button>
+        <button type="button" id="btn-quit-menu" class="btn btn-secondary">🏠 Return to Main Menu</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       11. GAME OVER / RUSH RESULTS MODAL
+       ====================================================================== -->
+  <div id="modal-gameover" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-window narrow" style="text-align:center;">
+      <div id="go-record-banners" class="go-record-banners">
+        <span id="go-new-record" class="game-badge record-pulse-badge hidden">🏆 NEW HIGH SCORE! 🏆</span>
+        <span id="go-rush-rank-badge" class="game-badge arcade-rank-badge hidden">🌟 #1 NEW RUSH RECORD!</span>
+      </div>
+
+      <h2 id="go-title" style="font-family:var(--font-display); font-size:1.95rem; color:var(--gold-bright); margin-bottom:4px;">Spire Overrun!</h2>
+      <p id="go-phase" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:14px;">Phase I: Dawn Breeze</p>
+
+      <div class="stats-grid">
+        <div class="stat-box">
+          <span>Final Score</span>
+          <strong id="go-score">0</strong>
+        </div>
+        <div class="stat-box">
+          <span>High Score</span>
+          <strong id="go-best">0</strong>
+        </div>
+        <div id="go-ot-box" class="stat-box hidden">
+          <span>Overtime Survival</span>
+          <strong id="go-overtime" style="color:var(--cyan);">OT 00:00</strong>
+        </div>
+        <div class="stat-box">
+          <span id="go-time-label">Total Match Time</span>
+          <strong id="go-time">00:00</strong>
+        </div>
+        <div class="stat-box">
+          <span>Highest Combo</span>
+          <strong id="go-combo">0x</strong>
+        </div>
+        <div class="stat-box">
+          <span>Rune Accuracy</span>
+          <strong id="go-accuracy">100%</strong>
+        </div>
+        <div id="go-defeated-box" class="stat-box">
+          <span>Raiders Defeated</span>
+          <strong id="go-defeated">0</strong>
+        </div>
+      </div>
+
+      <div class="menu-actions">
+        <button type="button" id="btn-play-again" class="btn btn-primary">🪄 Play Again</button>
+        <button type="button" id="btn-gameover-rush-lb" class="btn btn-arcade hidden">
+          🏆 RUSH LEADERBOARD
+        </button>
+        <button type="button" id="btn-gameover-menu" class="btn btn-secondary">🏠 Main Menu</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container for Achievement & Record Unlocks -->
+  <div id="toast-container" aria-live="polite"></div>
+
+  <!-- Modular Game Scripts (Ordered for both file:// and HTTP server compatibility) -->
+  <script defer src="js/config.js"></script>
+  <script defer src="js/symbols.js"></script>
+  <script defer src="js/recognizer.js"></script>
+  <script defer src="js/audio.js"></script>
+  <script defer src="js/particles.js"></script>
+  <script defer src="js/entities.js"></script>
+  <script defer src="js/spawner.js"></script>
+  <script defer src="js/leaderboard.js"></script>
+  <script defer src="js/camera.js"></script>
+  <script defer src="js/ui.js"></script>
+  <script defer src="js/game.js"></script>
+</body>
+</html>
