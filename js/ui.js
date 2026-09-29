@@ -69,7 +69,7 @@ window.Aetherward = window.Aetherward || {};
           reducedEffects: false,
           extraForgiving: false,
           camPauseOnLost: true,
-          camGestureMode: 'point_dwell',
+          camHoldTime: 'normal',
           theme: 'dynamic'
         }
       };
@@ -402,7 +402,7 @@ window.Aetherward = window.Aetherward || {};
       const selCamGesture = document.getElementById('setting-cam-gesture');
       if (selCamGesture) {
         selCamGesture.addEventListener('change', e => {
-          this.saveData.settings.camGestureMode = e.target.value;
+          this.saveData.settings.camHoldTime = e.target.value;
           this._persist();
           if (this.onSettingsChanged) this.onSettingsChanged(this.saveData.settings);
         });
@@ -426,7 +426,7 @@ window.Aetherward = window.Aetherward || {};
       if (chkReduced) chkReduced.checked = s.reducedEffects;
       if (chkForgiving) chkForgiving.checked = s.extraForgiving;
       if (chkCamPause) chkCamPause.checked = s.camPauseOnLost !== false;
-      if (selCamGesture) selCamGesture.value = s.camGestureMode || 'point_dwell';
+      if (selCamGesture) selCamGesture.value = s.camHoldTime || 'normal';
       if (selTheme) selTheme.value = s.theme;
 
       const isMuted = !s.sfxEnabled && !s.musicEnabled;

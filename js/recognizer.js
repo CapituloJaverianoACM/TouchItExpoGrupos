@@ -256,6 +256,7 @@ window.Aetherward = window.Aetherward || {};
   function compileAllTemplates() {
     const n = CFG.RESAMPLE_POINTS;
     for (const [id, sym] of Object.entries(Symbols.DEFINITIONS)) {
+      if (sym.isGesture) continue;
       compiledTemplates[id] = sym.templates.map(tpl => {
         const resampled = resample(tpl, n);
         const norm = normalizePoints(resampled);
@@ -619,6 +620,7 @@ window.Aetherward = window.Aetherward || {};
 
       const candidates = [];
       for (const [id, sym] of Object.entries(Symbols.DEFINITIONS)) {
+        if (sym.isGesture) continue; // Camera hand poses are not drawn strokes
         const tplScore = computeTemplateScore(id, normPts, Boolean(sym.directional));
         const geoBonus = computeGeometricAdjustment(id, features, normPts, rawPoints);
         const activeBoost = activeSymbols.has(id) ? CFG.ACTIVE_ON_SCREEN_BOOST : 0;

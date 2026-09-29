@@ -421,9 +421,22 @@ window.Aetherward = window.Aetherward || {};
   // ==========================================================================
   // HELPER FUNCTIONS FOR QUERYING & RENDERING SYMBOLS
   // ==========================================================================
-  function getSymbolsByTiers(allowedTiers) {
+  /**
+   * @param {string[]} allowedTiers
+   * @param {'rune'|'gesture'} symbolSet - drawn runes (mouse/touch) or hand gestures (camera)
+   */
+  function getSymbolsByTiers(allowedTiers, symbolSet = 'rune') {
     const tierSet = new Set(allowedTiers);
-    return Object.values(SYMBOL_DEFINITIONS).filter(sym => tierSet.has(sym.tier));
+    const wantGesture = symbolSet === 'gesture';
+    return Object.values(SYMBOL_DEFINITIONS).filter(
+      sym => tierSet.has(sym.tier) && Boolean(sym.isGesture) === wantGesture
+    );
+  }
+
+  // Alternate icon renderers (e.g. hand gestures registered by js/gestures.js)
+  const iconRenderers = {};
+  function registerIconRenderer(kind, fn) {
+    iconRenderers[kind] = fn;
   }
 
   /**
@@ -434,6 +447,11 @@ window.Aetherward = window.Aetherward || {};
   function drawSymbolIcon(ctx, symbolId, cx, cy, size, options = {}) {
     const sym = SYMBOL_DEFINITIONS[symbolId];
     if (!sym) return;
+    if (sym.isGesture && iconRenderers.gesture) {
+      // Hand silhouettes need more room than thin rune strokes to stay legible in a balloon
+      iconRenderers.gesture(ctx, symbolId, cx, cy, size * 1.3, options);
+      return;
+    }
 
     const {
       color = '#ffffff',
@@ -507,5 +525,6 @@ window.Aetherward = window.Aetherward || {};
     DEFINITIONS: SYMBOL_DEFINITIONS,
     getSymbolsByTiers,
     drawSymbolIcon,
+    registerIconRenderer,
   };
 })();

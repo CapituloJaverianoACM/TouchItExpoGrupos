@@ -1,11 +1,14 @@
 /**
  * ============================================================================
- * AETHERWARD: SKYBORNE SIGILS - Camera Recognition & Hand Tracking (js/camera.js)
+ * AETHERWARD: SKYBORNE SIGILS - Camera Hand-Gesture Control (js/camera.js)
  * ============================================================================
- * Provides local in-browser webcam hand & index-fingertip tracking using
- * MediaPipe Hands (with automatic local computer-vision fallback), velocity-
- * adaptive coordinate smoothing, multi-hand consistency locking, and a full
- * pre-game Setup -> Hand Detection -> Calibration -> 3-2-1-GO state machine.
+ * Camera Mode pipeline:
+ *
+ *   CAMERA -> MediaPipe HAND LANDMARKS -> HAND POSE CLASSIFICATION (handpose.js)
+ *          -> TEMPORAL VALIDATION (hold ~0.3 s) -> GESTURE CONFIRMED -> game action
+ *
+ * Also runs the short pre-game flow (permission -> gesture guide + hand
+ * detection -> 3-2-1 countdown) and the in-game PiP preview / feedback.
  *
  * PRIVACY: All video processing happens 100% locally in the browser memory.
  * No video frames are ever recorded, stored, or transmitted externally.
@@ -14,64 +17,22 @@
 window.Aetherward = window.Aetherward || {};
 
 (function () {
+  const CFG = window.Aetherward.CONFIG;
+  const Gestures = window.Aetherward.Gestures;
+  const { HandPoseClassifier, GestureStabilizer, FINGER_NAMES } = window.Aetherward.HandPose;
+
   // MediaPipe Hands 21-landmark connections for skeleton visualization
   const HAND_CONNECTIONS = [
     [0, 1], [1, 2], [2, 3], [3, 4],       // Thumb
-    [0, 5], [5, 6], [6, 7], [7, 8],       // Index finger (8 = Index Tip)
+    [0, 5], [5, 6], [6, 7], [7, 8],       // Index finger
     [0, 9], [9, 10], [10, 11], [11, 12],  // Middle finger
     [0, 13], [13, 14], [14, 15], [15, 16],// Ring finger
     [0, 17], [17, 18], [18, 19], [19, 20],// Pinky
     [5, 9], [9, 13], [13, 17]             // Palm knuckles
   ];
 
-  /**
-   * One Euro Filter (Casiez et al. 2012): adaptive low-pass filter that removes
-   * landmark jitter when the fingertip moves slowly while adding almost no lag
-   * during fast strokes.
-   */
-  class OneEuroFilter {
-    constructor(minCutoff, beta, dCutoff) {
-      this.minCutoff = minCutoff;
-      this.beta = beta;
-      this.dCutoff = dCutoff;
-      this.reset();
-    }
-
-    reset() {
-      this.x = null;
-      this.dx = 0;
-      this.lastTime = null;
-    }
-
-    _alpha(cutoff, dt) {
-      const tau = 1 / (2 * Math.PI * cutoff);
-      return 1 / (1 + tau / dt);
-    }
-
-    filter(value, timeSec) {
-      if (this.x === null || this.lastTime === null) {
-        this.x = value;
-        this.dx = 0;
-        this.lastTime = timeSec;
-        return value;
-      }
-      const dt = Math.max(1 / 120, Math.min(0.25, timeSec - this.lastTime));
-      this.lastTime = timeSec;
-
-      const rawDx = (value - this.x) / dt;
-      const aD = this._alpha(this.dCutoff, dt);
-      this.dx = this.dx + aD * (rawDx - this.dx);
-
-      const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
-      const a = this._alpha(cutoff, dt);
-      this.x = this.x + a * (value - this.x);
-      return this.x;
-    }
-  }
-
-  function dist3(a, b, ax) {
-    return Math.hypot((a.x - b.x) * ax, a.y - b.y, ((a.z || 0) - (b.z || 0)) * ax);
-  }
+  const HOLD_PRESETS = { fast: 0.2, normal: 0.3, relaxed: 0.45 };
+  const HAND_STABLE_SECONDS = 0.8;
 
   class CameraController {
     constructor(audio) {
@@ -91,87 +52,45 @@ window.Aetherward = window.Aetherward || {};
       this.settings = {
         showWebcamPreview: true,
         showSkeletonOverlay: true,
-        pauseOnHandLost: true,     // Freezes enemies/timer if hand is lost > 0.55s
-        gestureMode: 'point_dwell' // 'point_dwell' (Point & pause/curl) | 'pinch' (Thumb-index pinch)
+        pauseOnHandLost: true, // Freezes enemies/timer if hand is lost > 0.55s
+        holdTime: 'normal'     // 'fast' | 'normal' | 'relaxed' -> seconds a pose must be held
       };
 
-      // Hand & Index Fingertip Tracking State
+      // Debug overlay (finger states & pose scores): press "G" in Camera Mode or add ?gesturedebug=1
+      this.debugMode = /[?&]gesturedebug=1/.test(window.location.search);
+
+      // Hand tracking state
       this.handDetected = false;
       this.confidence = 0;
       this.handLostSeconds = 0;
       this.stableDetectionSeconds = 0;
       this.lastDetectionTime = 0;
-
-      // Normalized mirrored coordinates [0..1] in camera space
-      this.rawTipX = 0.5;
-      this.rawTipY = 0.5;
-      this.lockedWrist = null; // Used to maintain consistency when multiple hands appear
+      this.lastResultTime = 0;
+      this.lockedWrist = null; // Keeps the same hand when several are visible
       this.landmarks = null;
-
-      // Mapped & smoothed game-screen coordinates [0..width, 0..height]
-      this.screenX = window.innerWidth / 2;
-      this.screenY = window.innerHeight / 2;
-      this.velocity = 0;
-      this.lastCoordTime = 0;
-
-      // Adaptive jitter filters (operate in screen pixels)
-      this.filterX = new OneEuroFilter(1.4, 0.009, 1.0);
-      this.filterY = new OneEuroFilter(1.4, 0.009, 1.0);
-
-      // Grace period before a missing hand counts as "lost" (MediaPipe drops frames on fast motion)
       this.HAND_LOST_TIMEOUT_MS = 420;
 
-      // Recent cursor history while READY, used to recover the beginning of a stroke
-      this.recentCursorHistory = [];
-      this.STROKE_PREROLL_MS = 140;
-      // Timestamp when the fingertip began curling into a fist (used to trim the curl tail)
-      this.closeOnsetTime = 0;
-      this.CLOSE_TAIL_TRIM_MS = 110;
+      // Gesture pipeline
+      this.classifier = new HandPoseClassifier();
+      this.stabilizer = new GestureStabilizer();
+      this.rawGesture = { id: 'UNKNOWN', score: 0, reason: 'no_hand', fingers: null, scores: [] };
+      this.gestureStatus = { phase: 'idle', candidateId: null, latchedId: null, progress: 0 };
+      this.confirmFlash = null; // { id, timer, matched }
 
-      // Explicit Hand-Gesture State Machine:
-      // 'READY'       -> Index finger extended, waiting to begin a new stroke (active path is empty)
-      // 'DRAWING'     -> Index finger extended & recording trajectory into airStrokePoints
-      // 'FINALIZING'  -> Transient state that submits completed path and clears airStrokePoints
-      // 'CLOSED_HAND' -> Hand closed into a fist; stops recording and ignores all movement until index re-opens
-      this.gestureState = 'READY';
-      this.isFingerDrawing = false;
-      this.isPointingGesture = true;
-
-      // Debounce / State-Stability Filter for Hand Posture ('INDEX_EXTENDED' vs 'CLOSED_HAND')
-      this.rawPosture = 'INDEX_EXTENDED';
-      this.confirmedPosture = 'INDEX_EXTENDED';
-      this.candidatePosture = null;
-      this.candidatePostureFrames = 0;
-      this.CLOSE_DEBOUNCE_FRAMES = 3; // Consecutive closed-hand frames required to confirm CLOSED_HAND
-      this.OPEN_DEBOUNCE_FRAMES = 2;  // Consecutive open-index frames required to confirm INDEX_EXTENDED
-
-      // Fallback Dwell / Pause Completion & Thresholds
-      this.dwellTimer = 0;
-      this.DWELL_FINALIZE_SECONDS = 0.8;  // Fallback pause duration (long enough to not cut corners of shapes)
-      this.MIN_DRAW_SPEED = 45;           // Pixels/sec movement to transition READY -> DRAWING
-      this.STILL_SPEED_THRESHOLD = 40;    // Pixels/sec below which fallback dwell timer accumulates
-      this.airStrokePoints = [];
-      this.airStrokeTimes = [];
-      this.cooldownAfterCast = 0;
-      this.awaitingFreshMoveAfterFallback = false;
-
-      // Visual Feedback State for "Gesture Submitted" / State Indicator
-      this.submittedFeedbackTimer = 0;
-      this.submittedFeedbackPos = null;
-      this.lastSubmittedPointCount = 0;
-
-      // Setup & Calibration State Machine
-      // 'idle' | 'permission' | 'detect_hand' | 'calibrate' | 'countdown' | 'ready' | 'error'
+      // Setup state machine: 'idle' | 'permission' | 'detect_hand' | 'countdown' | 'ready' | 'error'
       this.setupStage = 'idle';
-      this.calibrationWaypoints = [];
-      this.calibrationTrail = [];
       this.countdownRemaining = 3.0;
       this.onSetupCompleteCallback = null;
 
       // Callbacks into Game
-      this.onAirStrokeCompleted = null;
+      this.onGestureConfirmed = null; // (gestureId) => boolean (true if it hit something)
 
       this._initDOMReferences();
+      window.addEventListener('keydown', e => {
+        if (e.code === 'KeyG' && this.isRunning && this.controlMode === 'camera') {
+          this.debugMode = !this.debugMode;
+        }
+      });
     }
 
     _initDOMReferences() {
@@ -184,6 +103,7 @@ window.Aetherward = window.Aetherward || {};
       this.setupSubtext = document.getElementById('camera-setup-subtext');
       this.setupProgressFill = document.getElementById('camera-setup-progress-fill');
       this.setupCountdownOverlay = document.getElementById('camera-countdown-overlay');
+      this.gestureGuideEl = document.getElementById('camera-gesture-guide');
 
       // In-Game PiP Widget
       this.pipContainer = document.getElementById('hud-camera-pip');
@@ -191,24 +111,15 @@ window.Aetherward = window.Aetherward || {};
       this.pipCtx = this.pipCanvas ? this.pipCanvas.getContext('2d') : null;
       this.pipConfidenceText = document.getElementById('pip-confidence-text');
       this.pipStateDot = document.getElementById('pip-state-dot');
+      this.pipGestureLabel = document.getElementById('pip-gesture-label');
+      this.pipHoldFill = document.getElementById('pip-hold-fill');
       this.handLostBanner = document.getElementById('hud-hand-lost-banner');
 
-      // Bind PiP & Setup UI buttons
       const btnCancelSetup = document.getElementById('btn-cancel-camera-setup');
       if (btnCancelSetup) {
         btnCancelSetup.addEventListener('click', () => {
           this.audio.playUIClick();
           this.closeSetupModal();
-        });
-      }
-
-      const btnSkipCalib = document.getElementById('btn-skip-calibration');
-      if (btnSkipCalib) {
-        btnSkipCalib.addEventListener('click', () => {
-          if (this.handDetected && this.setupStage === 'calibrate') {
-            this.audio.playUIClick();
-            this._enterCountdownStage();
-          }
         });
       }
 
@@ -232,6 +143,30 @@ window.Aetherward = window.Aetherward || {};
           }
         });
       }
+
+      this._renderGestureGuide();
+    }
+
+    /**
+     * Builds the gesture reference panel shown during camera setup.
+     */
+    _renderGestureGuide() {
+      if (!this.gestureGuideEl) return;
+      this.gestureGuideEl.innerHTML = '';
+      const tierLabel = { easy: 'Start', medium: '30s+', hard: '90s+', expert: '180s+' };
+      for (const g of Object.values(Gestures.DEFINITIONS)) {
+        const card = document.createElement('div');
+        card.className = 'gesture-guide-card';
+        card.title = g.hint;
+        card.innerHTML = `
+          <canvas width="56" height="56"></canvas>
+          <strong>${g.emoji} ${g.name}</strong>
+          <span>${tierLabel[g.tier] || ''}</span>
+        `;
+        this.gestureGuideEl.appendChild(card);
+        const c = card.querySelector('canvas');
+        Gestures.drawGestureIcon(c.getContext('2d'), g.id, 28, 28, 50, { glowColor: g.color });
+      }
     }
 
     isCameraModeEnabled() {
@@ -247,6 +182,11 @@ window.Aetherward = window.Aetherward || {};
       }
     }
 
+    applyHoldTime(preset) {
+      this.settings.holdTime = HOLD_PRESETS[preset] ? preset : 'normal';
+      CFG.GESTURE_RECOGNITION.HOLD_SECONDS = HOLD_PRESETS[this.settings.holdTime];
+    }
+
     // ------------------------------------------------------------------------
     // 1. CAMERA & MEDIAPIPE INITIALIZATION
     // ------------------------------------------------------------------------
@@ -255,13 +195,16 @@ window.Aetherward = window.Aetherward || {};
       this.setupStage = 'permission';
       this.stableDetectionSeconds = 0;
       this.handDetected = false;
-      this._resetGestureStateMachine('READY');
+      this._resetGesturePipeline();
 
       if (this.setupModal) {
         this.setupModal.classList.remove('hidden');
       }
+      if (this.setupCountdownOverlay) {
+        this.setupCountdownOverlay.classList.add('hidden');
+      }
       this._updateSetupUI(
-        'STEP 1 OF 3 • CAMERA PERMISSION',
+        'STEP 1 OF 2 • CAMERA PERMISSION',
         'ALLOW CAMERA ACCESS',
         'Please grant webcam permission in your browser. Video is processed 100% locally for hand tracking.',
         10
@@ -291,9 +234,22 @@ window.Aetherward = window.Aetherward || {};
 
         await this._ensureMediaPipeHandsLoaded();
 
+        if (!this.mpLoaded) {
+          // Static gestures need full hand landmarks; the old color-blob fallback can't classify poses
+          this.setupStage = 'error';
+          this._updateSetupUI(
+            'HAND MODEL UNAVAILABLE',
+            'COULD NOT LOAD THE HAND TRACKER',
+            'Camera gestures need an internet connection the first time (MediaPipe Hands is loaded from a CDN). Connect and try again, or switch to Standard (Mouse / Touch) control.',
+            0
+          );
+          return;
+        }
+
+        const alreadyRunning = this.isRunning;
         this.isRunning = true;
         this._enterDetectHandStage();
-        this._pumpDetectionLoop();
+        if (!alreadyRunning) this._pumpDetectionLoop(); // Avoid stacking loops on "Play Again"
       } catch (err) {
         this.setupStage = 'error';
         this._updateSetupUI(
@@ -332,17 +288,16 @@ window.Aetherward = window.Aetherward || {};
             locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
           });
           this.mpHands.setOptions({
-            maxNumHands: 2,
-            modelComplexity: 1, // Full model: far more stable fingertip landmarks than the lite model
+            maxNumHands: 2,     // Lets us stay locked on the player's hand when bystanders appear
+            modelComplexity: 1, // Full model: more stable finger landmarks than the lite model
             minDetectionConfidence: 0.6,
-            minTrackingConfidence: 0.5 // Lower tracking threshold = fewer re-detections / dropped frames mid-stroke
+            minTrackingConfidence: 0.5
           });
           this.mpHands.onResults(results => this._onMediaPipeResults(results));
           this.mpLoaded = true;
         }
       } catch (err) {
-        // If CDN is unreachable offline, we fall back to our built-in local motion/color tracker
-        console.warn('MediaPipe Hands CDN unreachable, using built-in local motion tracker fallback.', err);
+        console.warn('MediaPipe Hands CDN unreachable; camera gestures unavailable.', err);
         this.mpLoaded = false;
       } finally {
         this.mpLoading = false;
@@ -352,7 +307,7 @@ window.Aetherward = window.Aetherward || {};
     stopCamera() {
       this.isRunning = false;
       this.handDetected = false;
-      this._resetGestureStateMachine('READY');
+      this._resetGesturePipeline();
       if (this.stream) {
         this.stream.getTracks().forEach(t => t.stop());
         this.stream = null;
@@ -372,8 +327,16 @@ window.Aetherward = window.Aetherward || {};
       this.setupStage = 'idle';
     }
 
+    _resetGesturePipeline() {
+      this.classifier.reset();
+      this.stabilizer.reset();
+      this.rawGesture = { id: 'UNKNOWN', score: 0, reason: 'no_hand', fingers: null, scores: [] };
+      this.gestureStatus = { phase: 'idle', candidateId: null, latchedId: null, progress: 0 };
+      this.confirmFlash = null;
+    }
+
     // ------------------------------------------------------------------------
-    // 2. SETUP & CALIBRATION STATE MACHINE
+    // 2. SETUP STATE MACHINE (guide + hand detection -> countdown)
     // ------------------------------------------------------------------------
     _enterDetectHandStage() {
       this.setupStage = 'detect_hand';
@@ -381,37 +344,11 @@ window.Aetherward = window.Aetherward || {};
       if (this.setupCountdownOverlay) {
         this.setupCountdownOverlay.classList.add('hidden');
       }
-      const skipBtn = document.getElementById('btn-skip-calibration');
-      if (skipBtn) skipBtn.classList.add('hidden');
-
       this._updateSetupUI(
-        'STEP 2 OF 3 • HAND DETECTION',
-        'SHOW YOUR HAND TO THE CAMERA',
-        'Hold your hand up in front of the camera and point with your index finger.',
-        30
-      );
-    }
-
-    _enterCalibrationStage() {
-      this.setupStage = 'calibrate';
-      this.audio.playBalloonPop(3);
-
-      // Create 3 calibration waypoints arranged in a comfortable triangle/circle
-      this.calibrationWaypoints = [
-        { nx: 0.50, ny: 0.25, label: '1', reached: false },
-        { nx: 0.74, ny: 0.65, label: '2', reached: false },
-        { nx: 0.26, ny: 0.65, label: '3', reached: false }
-      ];
-      this.calibrationTrail = [];
-
-      const skipBtn = document.getElementById('btn-skip-calibration');
-      if (skipBtn) skipBtn.classList.remove('hidden');
-
-      this._updateSetupUI(
-        'STEP 3 OF 3 • FINGER CALIBRATION',
-        'HAND DETECTED — MOVE YOUR INDEX FINGER',
-        'Guide your glowing index fingertip through the 3 arcane targets (1 → 2 → 3) to verify smooth tracking!',
-        65
+        'STEP 2 OF 2 • SHOW YOUR HAND',
+        'PLACE YOUR HAND INSIDE THE FRAME',
+        'Hold one hand up, about an arm\'s length from the camera. Meanwhile, check the gestures below!',
+        40
       );
     }
 
@@ -419,13 +356,12 @@ window.Aetherward = window.Aetherward || {};
       this.setupStage = 'countdown';
       this.countdownRemaining = 3.2;
       this.lastCountdownBeepInt = 4;
-      const skipBtn = document.getElementById('btn-skip-calibration');
-      if (skipBtn) skipBtn.classList.add('hidden');
+      this.audio.playBalloonPop(3);
 
       this._updateSetupUI(
-        'CALIBRATION COMPLETE',
+        'HAND DETECTED',
         'CAMERA READY!',
-        'Open index finger to draw • Close hand into a fist to submit each rune! Starting in 3, 2, 1, GO!',
+        'Copy the hand gesture shown on a balloon and hold it for a moment to cast. Starting in 3, 2, 1...',
         100
       );
 
@@ -442,427 +378,38 @@ window.Aetherward = window.Aetherward || {};
       if (this.setupProgressFill) this.setupProgressFill.style.width = `${progressPct}%`;
     }
 
-    // ------------------------------------------------------------------------
-    // 3. REAL-TIME LANDMARK DETECTION, POSTURE CLASSIFICATION & DEBOUNCE
-    // ------------------------------------------------------------------------
-    async _pumpDetectionLoop() {
-      if (!this.isRunning) return;
-
-      if (
-        this.videoEl &&
-        this.videoEl.readyState >= 2 &&
-        !this.processingFrame
-      ) {
-        this.processingFrame = true;
-        try {
-          if (this.mpLoaded && this.mpHands) {
-            await this.mpHands.send({ image: this.videoEl });
-          } else {
-            this._runFallbackMotionTracker();
-          }
-        } catch (_) {
-          // Ignore transient frame errors
-        }
-        this.processingFrame = false;
-      }
-
-      if (this.isRunning) {
-        requestAnimationFrame(() => this._pumpDetectionLoop());
-      }
-    }
-
-    _onMediaPipeResults(results) {
-      const hands = results.multiHandLandmarks;
-      if (!hands || hands.length === 0) {
-        // Don't drop the stroke on a single missed frame (common during fast motion blur).
-        // update() declares the hand lost once HAND_LOST_TIMEOUT_MS elapses without detections.
-        return;
-      }
-
-      // Select primary hand consistently:
-      // Prefer the hand closest to our previously tracked wrist, or closest to center (0.5, 0.5)
-      let chosenHand = hands[0];
-      let chosenIdx = 0;
-
-      if (hands.length > 1) {
-        let bestScore = Infinity;
-        for (let i = 0; i < hands.length; i++) {
-          const wrist = hands[i][0];
-          const wx = 1 - wrist.x; // Mirrored X
-          const wy = wrist.y;
-          let d;
-          if (this.lockedWrist && this.handDetected) {
-            d = Math.hypot(wx - this.lockedWrist.x, wy - this.lockedWrist.y);
-          } else {
-            d = Math.hypot(wx - 0.5, wy - 0.5);
-          }
-          if (d < bestScore) {
-            bestScore = d;
-            chosenHand = hands[i];
-            chosenIdx = i;
-          }
-        }
-      }
-
-      const handednessScore =
-        results.multiHandedness &&
-        results.multiHandedness[chosenIdx] &&
-        results.multiHandedness[chosenIdx].score
-          ? results.multiHandedness[chosenIdx].score
-          : 0.92;
-
-      this.confidence = handednessScore;
-      this.landmarks = chosenHand;
-      this.lockedWrist = { x: 1 - chosenHand[0].x, y: chosenHand[0].y };
-
-      // Classify raw hand posture ('INDEX_EXTENDED' vs 'CLOSED_HAND') and pass through debounce filter
-      const wasHandDetected = this.handDetected;
-      const detectedPosture = this._classifyRawHandPosture(chosenHand);
-      const prevConfirmedPosture = this.confirmedPosture;
-      this._updatePostureDebounce(detectedPosture);
-
-      // During candidate-closed debounce frames (while confirmedPosture is still INDEX_EXTENDED
-      // but rawPosture is CLOSED_HAND), freeze coordinate updates so the physical curling of
-      // the index finger into a fist never pulls the cursor or distorts the stroke path!
-      if (this.confirmedPosture === 'INDEX_EXTENDED' && detectedPosture === 'CLOSED_HAND') {
-        if (this.candidatePostureFrames <= 1) {
-          this.closeOnsetTime = performance.now();
-        }
-        this.handDetected = true;
-        this.handLostSeconds = 0;
-        this.lastDetectionTime = performance.now();
-        return;
-      }
-
-      // Track landmark 8 (index tip) when extended, or landmark 5 (index knuckle) when fist is closed
-      const trackedLandmark =
-        this.confirmedPosture === 'CLOSED_HAND' ? chosenHand[5] : chosenHand[8];
-      const mirroredX = 1 - trackedLandmark.x;
-      const mirroredY = trackedLandmark.y;
-
-      // Snap cursor cleanly when hand first appears or when transitioning CLOSED_HAND -> INDEX_EXTENDED
-      const snapToNewPosition =
-        !wasHandDetected ||
-        (prevConfirmedPosture === 'CLOSED_HAND' && this.confirmedPosture === 'INDEX_EXTENDED');
-
-      this._updateTrackedCoordinates(mirroredX, mirroredY, snapToNewPosition);
-    }
-
-    /**
-     * Classifies the raw single-frame hand posture into:
-     * - 'INDEX_EXTENDED': Index finger is open/extended for drawing
-     * - 'CLOSED_HAND':    Hand is closed into a fist (or index finger curled), signaling "end drawing"
-     */
-    _classifyRawHandPosture(lm) {
-      const wrist = lm[0];
-      const thumbTip = lm[4];
-      const indexMCP = lm[5];
-      const indexPIP = lm[6];
-      const indexDIP = lm[7] || lm[6];
-      const indexTip = lm[8];
-      const middleMCP = lm[9];
-
-      // Landmark x/y are normalized separately by width/height; correct for the video aspect
-      // ratio so distances are isotropic. z shares the x scale.
-      const ax =
-        this.videoEl && this.videoEl.videoWidth && this.videoEl.videoHeight
-          ? this.videoEl.videoWidth / this.videoEl.videoHeight
-          : 4 / 3;
-
-      // Scale-invariant reference: palm length (wrist -> middle knuckle), robust to hand rotation
-      const palmSize = Math.max(0.03, dist3(wrist, middleMCP, ax), dist3(wrist, indexMCP, ax));
-      const wasExtended = this.confirmedPosture === 'INDEX_EXTENDED';
-
-      if (this.settings.gestureMode === 'pinch') {
-        // Hysteresis: engage pinch when close, release only when clearly apart
-        const pinchRatio = dist3(thumbTip, indexTip, ax) / palmSize;
-        const pinchThreshold = wasExtended ? 0.42 : 0.3;
-        return pinchRatio < pinchThreshold ? 'INDEX_EXTENDED' : 'CLOSED_HAND';
-      }
-
-      const tipToWrist = dist3(indexTip, wrist, ax);
-      const pipToWrist = dist3(indexPIP, wrist, ax);
-      const dipToWrist = dist3(indexDIP, wrist, ax);
-      const reach = dist3(indexTip, indexMCP, ax) / palmSize;
-
-      // Straightness of the index finger: cosine between proximal (MCP->PIP) and distal (PIP->TIP) segments
-      const v1x = (indexPIP.x - indexMCP.x) * ax, v1y = indexPIP.y - indexMCP.y, v1z = ((indexPIP.z || 0) - (indexMCP.z || 0)) * ax;
-      const v2x = (indexTip.x - indexPIP.x) * ax, v2y = indexTip.y - indexPIP.y, v2z = ((indexTip.z || 0) - (indexPIP.z || 0)) * ax;
-      const n1 = Math.hypot(v1x, v1y, v1z);
-      const n2 = Math.hypot(v2x, v2y, v2z);
-      const straightness = n1 > 1e-6 && n2 > 1e-6 ? (v1x * v2x + v1y * v2y + v1z * v2z) / (n1 * n2) : 1;
-
-      // Tip folded back past its own joints => unambiguously closed
-      if (tipToWrist < pipToWrist || tipToWrist < dipToWrist * 0.98) {
-        return 'CLOSED_HAND';
-      }
-
-      if (wasExtended) {
-        // Stay extended unless the finger is clearly curled (prevents flicker mid-stroke)
-        const curled = reach < 0.42 || straightness < 0.15 || tipToWrist < palmSize * 1.05;
-        return curled ? 'CLOSED_HAND' : 'INDEX_EXTENDED';
-      }
-
-      // Require a clearly straight, reaching finger to (re)open
-      const extended = reach > 0.55 && straightness > 0.55 && tipToWrist > palmSize * 1.2;
-      return extended ? 'INDEX_EXTENDED' : 'CLOSED_HAND';
-    }
-
-    /**
-     * Debounces raw posture classifications across consecutive frames so single-frame
-     * landmark jitter never prematurely ends or starts a gesture.
-     */
-    _updatePostureDebounce(rawPosture) {
-      this.rawPosture = rawPosture;
-
-      if (rawPosture === this.confirmedPosture) {
-        this.candidatePosture = null;
-        this.candidatePostureFrames = 0;
-        this.isPointingGesture = this.confirmedPosture === 'INDEX_EXTENDED';
-        return;
-      }
-
-      if (this.candidatePosture === rawPosture) {
-        this.candidatePostureFrames++;
-      } else {
-        this.candidatePosture = rawPosture;
-        this.candidatePostureFrames = 1;
-      }
-
-      const requiredFrames =
-        rawPosture === 'CLOSED_HAND' ? this.CLOSE_DEBOUNCE_FRAMES : this.OPEN_DEBOUNCE_FRAMES;
-
-      if (this.candidatePostureFrames >= requiredFrames) {
-        this.confirmedPosture = rawPosture;
-        this.candidatePosture = null;
-        this.candidatePostureFrames = 0;
-      }
-
-      this.isPointingGesture = this.confirmedPosture === 'INDEX_EXTENDED';
-    }
-
-    /**
-     * Built-in fallback tracker if offline / CDN blocked: tracks the highest
-     * moving bright/skin-toned fingertip blob in the webcam feed.
-     */
-    _runFallbackMotionTracker() {
-      if (!this._fallbackCanvas) {
-        this._fallbackCanvas = document.createElement('canvas');
-        this._fallbackCanvas.width = 80;
-        this._fallbackCanvas.height = 60;
-        this._fallbackCtx = this._fallbackCanvas.getContext('2d', { willReadFrequently: true });
-      }
-      const w = 80, h = 60;
-      const ctx = this._fallbackCtx;
-      ctx.drawImage(this.videoEl, 0, 0, w, h);
-      const frame = ctx.getImageData(0, 0, w, h).data;
-
-      let count = 0;
-      let topY = h, topX = w / 2;
-      let minY = h, maxY = 0;
-
-      for (let y = 4; y < h - 4; y++) {
-        for (let x = 4; x < w - 4; x++) {
-          const i = (y * w + x) * 4;
-          const r = frame[i], g = frame[i + 1], b = frame[i + 2];
-          if (r > 95 && g > 40 && b > 20 && r > g && r > b && (r - Math.min(g, b)) > 18) {
-            count++;
-            if (y < topY) {
-              topY = y;
-              topX = x;
-            }
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
-        }
-      }
-
-      if (count > 28) {
-        const mx = 1 - (topX / w);
-        const my = topY / h;
-        this.confidence = 0.82;
-        // Aspect heuristic for fallback: tall contour = extended finger, compact = closed fist
-        const verticalSpan = maxY - minY;
-        const rawPosture = verticalSpan >= 14 ? 'INDEX_EXTENDED' : 'CLOSED_HAND';
-        this._updatePostureDebounce(rawPosture);
-        this.landmarks = null;
-        this._updateTrackedCoordinates(mx, my, !this.handDetected);
-      }
-      // No blob this frame: update() declares the hand lost after HAND_LOST_TIMEOUT_MS
-    }
-
-    _markHandLost() {
-      this.handDetected = false;
-      this.confidence = 0;
-      this.landmarks = null;
-      // Discard incomplete stroke without penalty if hand leaves camera view mid-drawing
-      this._resetGestureStateMachine('READY');
-    }
-
-    _resetGestureStateMachine(targetState = 'READY') {
-      this.gestureState = targetState;
-      this.isFingerDrawing = targetState === 'DRAWING';
-      this.airStrokePoints = [];
-      this.airStrokeTimes = [];
-      this.recentCursorHistory = [];
-      this.dwellTimer = 0;
-      this.candidatePosture = null;
-      this.candidatePostureFrames = 0;
-      this.awaitingFreshMoveAfterFallback = false;
-    }
-
-    _updateTrackedCoordinates(mirroredNormX, mirroredNormY, snapImmediately = false) {
-      this.handDetected = true;
-      this.handLostSeconds = 0;
-      this.lastDetectionTime = performance.now();
-
-      this.rawTipX = mirroredNormX;
-      this.rawTipY = mirroredNormY;
-
-      // Map comfortable inner camera box [0.14..0.86] x [0.15..0.85] to full screen [0..W, 0..H]
-      const marginX = 0.14;
-      const marginY = 0.15;
-      const clampedX = Math.max(0, Math.min(1, (mirroredNormX - marginX) / (1 - marginX * 2)));
-      const clampedY = Math.max(0, Math.min(1, (mirroredNormY - marginY) / (1 - marginY * 2)));
-
-      const targetX = clampedX * window.innerWidth;
-      const targetY = clampedY * window.innerHeight;
-      const nowMs = performance.now();
-      const tSec = nowMs / 1000;
-
-      if (snapImmediately) {
-        this.filterX.reset();
-        this.filterY.reset();
-        this.screenX = this.filterX.filter(targetX, tSec);
-        this.screenY = this.filterY.filter(targetY, tSec);
-        this.velocity = 0;
-        this.lastCoordTime = nowMs;
-        return;
-      }
-
-      // One Euro filtering: heavy smoothing when slow/still (kills jitter), minimal lag when fast
-      const prevX = this.screenX;
-      const prevY = this.screenY;
-      this.screenX = this.filterX.filter(targetX, tSec);
-      this.screenY = this.filterY.filter(targetY, tSec);
-
-      const dtSec = Math.max(1 / 120, Math.min(0.25, (nowMs - (this.lastCoordTime || nowMs - 33)) / 1000));
-      this.lastCoordTime = nowMs;
-      const instVelocity = Math.hypot(this.screenX - prevX, this.screenY - prevY) / dtSec;
-      // Light smoothing of the speed estimate so state transitions don't trigger on a single noisy frame
-      this.velocity = this.velocity * 0.4 + instVelocity * 0.6;
-    }
-
-    // ------------------------------------------------------------------------
-    // 4. PER-FRAME UPDATE (Setup Calibration + Explicit Hand-State Machine)
-    // ------------------------------------------------------------------------
-    update(dt, isGameplayActive) {
-      if (!this.isRunning) return;
-
-      if (this.submittedFeedbackTimer > 0) {
-        this.submittedFeedbackTimer = Math.max(0, this.submittedFeedbackTimer - dt);
-      }
-
-      // Check if detector hasn't reported a hand within the grace period
-      if (this.handDetected && performance.now() - this.lastDetectionTime > this.HAND_LOST_TIMEOUT_MS) {
-        this._markHandLost();
-      }
-
-      if (!this.handDetected) {
-        this.handLostSeconds += dt;
-      }
-
-      // A. Update Setup & Calibration Modal if open
-      if (this.setupStage !== 'idle' && this.setupStage !== 'ready') {
-        this._updateSetupStateMachine(dt);
-        this._renderSetupCanvas();
-        return;
-      }
-
-      // B. Update In-Game PiP Overlay & Air-Drawing State Machine
-      if (isGameplayActive && this.controlMode === 'camera') {
-        if (this.pipContainer) {
-          this.pipContainer.classList.remove('hidden');
-        }
-        if (this.handLostBanner) {
-          this.handLostBanner.classList.toggle('hidden', this.handDetected);
-        }
-
-        this._updateInGameAirDrawing(dt);
-        this._renderPipCanvas();
-      }
-    }
-
     _updateSetupStateMachine(dt) {
       if (this.setupStage === 'detect_hand') {
         if (this.handDetected) {
           this.stableDetectionSeconds += dt;
-          const pct = Math.min(100, Math.round((this.stableDetectionSeconds / 0.9) * 100));
+          const pct = Math.min(100, Math.round((this.stableDetectionSeconds / HAND_STABLE_SECONDS) * 100));
           this._updateSetupUI(
-            'STEP 2 OF 3 • CONFIRMING STABILITY',
-            `HAND DETECTED (${pct}%)`,
-            'Hold steady for a brief moment to lock onto your index fingertip...',
-            30 + pct * 0.35
+            'STEP 2 OF 2 • HAND DETECTED',
+            `LOCKING ON… ${pct}%`,
+            'Keep your hand in view for a moment.',
+            40 + pct * 0.5
           );
-          if (this.stableDetectionSeconds >= 0.9) {
-            this._enterCalibrationStage();
+          if (this.stableDetectionSeconds >= HAND_STABLE_SECONDS) {
+            this._enterCountdownStage();
           }
         } else {
           this.stableDetectionSeconds = Math.max(0, this.stableDetectionSeconds - dt * 1.5);
           this._updateSetupUI(
-            'STEP 2 OF 3 • HAND DETECTION',
-            'SHOW YOUR HAND TO THE CAMERA',
-            'Raise one hand clearly in front of the webcam so your index fingertip can be tracked.',
-            30
+            'STEP 2 OF 2 • SHOW YOUR HAND',
+            'PLACE YOUR HAND INSIDE THE FRAME',
+            'Hold one hand up, about an arm\'s length from the camera. Meanwhile, check the gestures below!',
+            40
           );
-        }
-      } else if (this.setupStage === 'calibrate') {
-        if (!this.handDetected) {
-          this._updateSetupUI(
-            'STEP 3 OF 3 • HAND LOST',
-            'SHOW YOUR HAND TO CONTINUE CALIBRATION',
-            'Keep your hand within the camera frame and touch the 3 glowing targets.',
-            55
-          );
-          return;
-        }
-
-        const nx = this.screenX / Math.max(1, window.innerWidth);
-        const ny = this.screenY / Math.max(1, window.innerHeight);
-
-        this.calibrationTrail.push([nx, ny]);
-        if (this.calibrationTrail.length > 36) {
-          this.calibrationTrail.shift();
-        }
-
-        let reachedCount = 0;
-        for (const wp of this.calibrationWaypoints) {
-          if (!wp.reached && Math.hypot(nx - wp.nx, ny - wp.ny) < 0.13) {
-            wp.reached = true;
-            this.audio.playBalloonPop(reachedCount + 2);
-          }
-          if (wp.reached) reachedCount++;
-        }
-
-        this._updateSetupUI(
-          `STEP 3 OF 3 • CALIBRATION (${reachedCount}/3 TARGETS)`,
-          'HAND DETECTED — MOVE YOUR INDEX FINGER',
-          'Move your index fingertip through the glowing targets to verify smooth tracking!',
-          65 + (reachedCount / 3) * 30
-        );
-
-        if (reachedCount === this.calibrationWaypoints.length) {
-          this._enterCountdownStage();
         }
       } else if (this.setupStage === 'countdown') {
-        // Crucial requirement: If hand is lost during 3-2-1 countdown, pause countdown!
+        // Countdown pauses while the hand is out of view
         if (!this.handDetected) {
           if (this.setupCountdownOverlay) {
             this.setupCountdownOverlay.textContent = '🖐️';
           }
           this._updateSetupUI(
             'COUNTDOWN PAUSED • HAND LOST',
-            'SHOW YOUR HAND TO RESUME COUNTDOWN',
+            'SHOW YOUR HAND TO RESUME',
             'The game will not start until your hand is visible again!',
             92
           );
@@ -872,7 +419,7 @@ window.Aetherward = window.Aetherward || {};
         this._updateSetupUI(
           'CAMERA READY',
           'CAMERA READY — GET SET!',
-          'Open index finger to draw • Close hand into a fist to submit each rune!',
+          'Copy the hand gesture shown on a balloon and hold it for a moment to cast!',
           100
         );
 
@@ -890,9 +437,9 @@ window.Aetherward = window.Aetherward || {};
 
         if (this.countdownRemaining <= -0.25) {
           this.setupStage = 'ready';
-          this._resetGestureStateMachine(
-            this.confirmedPosture === 'CLOSED_HAND' ? 'CLOSED_HAND' : 'READY'
-          );
+          // Whatever pose the player is holding at GO must be released before it can fire
+          this.stabilizer.reset();
+          if (this.rawGesture.id !== 'UNKNOWN') this.stabilizer.latchedId = this.rawGesture.id;
           this.closeSetupModal();
           if (this.onSetupCompleteCallback) {
             const cb = this.onSetupCompleteCallback;
@@ -903,269 +450,127 @@ window.Aetherward = window.Aetherward || {};
       }
     }
 
-    /**
-     * Explicit 4-State Gesture Machine:
-     *   READY -> DRAWING -> FINALIZING -> CLOSED_HAND -> READY
-     *
-     * Flow:
-     *   Open index finger (READY)
-     *   -> Move index finger to draw (DRAWING)
-     *   -> Close hand into a fist (FINALIZING -> submits & clears path -> CLOSED_HAND)
-     *   -> Open index finger again (READY for a brand-new disconnected gesture)
-     *
-     * Also keeps pause-based dwell completion (DRAWING -> FINALIZING -> READY) as a fallback.
-     */
-    _updateInGameAirDrawing(dt) {
-      if (this.cooldownAfterCast > 0) {
-        this.cooldownAfterCast = Math.max(0, this.cooldownAfterCast - dt);
+    // ------------------------------------------------------------------------
+    // 3. LANDMARKS -> POSE CLASSIFICATION -> TEMPORAL VALIDATION
+    // ------------------------------------------------------------------------
+    async _pumpDetectionLoop() {
+      if (!this.isRunning) return;
+
+      if (this.videoEl && this.videoEl.readyState >= 2 && !this.processingFrame && this.mpHands) {
+        this.processingFrame = true;
+        try {
+          await this.mpHands.send({ image: this.videoEl });
+        } catch (_) {
+          // Ignore transient frame errors
+        }
+        this.processingFrame = false;
       }
 
-      if (!this.handDetected) {
+      if (this.isRunning) {
+        requestAnimationFrame(() => this._pumpDetectionLoop());
+      }
+    }
+
+    _onMediaPipeResults(results) {
+      const now = performance.now();
+      const dtMs = this.lastResultTime ? now - this.lastResultTime : 33;
+      this.lastResultTime = now;
+
+      const hands = results.multiHandLandmarks;
+      if (!hands || hands.length === 0) {
+        // Single missed frames are tolerated; update() declares the hand lost after a timeout
+        this._feedGesture({ id: 'UNKNOWN', score: 0, reason: 'no_hand', fingers: null, scores: [] }, dtMs);
         return;
       }
 
-      const pt = [this.screenX, this.screenY];
-      const nowMs = performance.now();
-
-      switch (this.gestureState) {
-        case 'CLOSED_HAND': {
-          // Strictly guarantee no points are ever recorded while hand remains closed
-          this.isFingerDrawing = false;
-          if (this.airStrokePoints.length > 0) {
-            this.airStrokePoints = [];
+      // Keep following the same hand when several are visible (closest to the last tracked wrist)
+      let chosenIdx = 0;
+      if (hands.length > 1) {
+        let bestScore = Infinity;
+        for (let i = 0; i < hands.length; i++) {
+          const wx = 1 - hands[i][0].x;
+          const wy = hands[i][0].y;
+          const d = this.lockedWrist && this.handDetected
+            ? Math.hypot(wx - this.lockedWrist.x, wy - this.lockedWrist.y)
+            : Math.hypot(wx - 0.5, wy - 0.5);
+          if (d < bestScore) {
+            bestScore = d;
+            chosenIdx = i;
           }
-          this.dwellTimer = 0;
-
-          // Transition CLOSED_HAND -> READY only when index finger is stably extended again
-          if (this.confirmedPosture === 'INDEX_EXTENDED') {
-            this.gestureState = 'READY';
-            this.airStrokePoints = [];
-            this.dwellTimer = 0;
-            this.awaitingFreshMoveAfterFallback = false;
-          }
-          break;
         }
+      }
+      const hand = hands[chosenIdx];
 
-        case 'READY': {
-          this.isFingerDrawing = false;
-          if (this.airStrokePoints.length > 0) {
-            this.airStrokePoints = [];
-            this.airStrokeTimes = [];
-          }
+      const handedness = results.multiHandedness && results.multiHandedness[chosenIdx];
+      this.confidence = handedness && handedness.score ? handedness.score : 0.92;
+      this.landmarks = hand;
+      this.lockedWrist = { x: 1 - hand[0].x, y: hand[0].y };
+      this.handDetected = true;
+      this.handLostSeconds = 0;
+      this.lastDetectionTime = now;
 
-          // Keep a short cursor history so the first few pixels of a stroke (drawn before
-          // the speed threshold is crossed) are not lost
-          if (this.rawPosture === 'INDEX_EXTENDED') {
-            this.recentCursorHistory.push({ x: pt[0], y: pt[1], t: nowMs });
-            while (
-              this.recentCursorHistory.length > 0 &&
-              nowMs - this.recentCursorHistory[0].t > this.STROKE_PREROLL_MS
-            ) {
-              this.recentCursorHistory.shift();
-            }
-          } else {
-            this.recentCursorHistory = [];
-          }
+      const aspect =
+        this.videoEl && this.videoEl.videoWidth && this.videoEl.videoHeight
+          ? this.videoEl.videoWidth / this.videoEl.videoHeight
+          : 4 / 3;
+      const result = this.classifier.classify(hand, { aspect });
+      this._feedGesture(result, dtMs);
+    }
 
-          // If player closes their hand while in READY, enter CLOSED_HAND immediately
-          if (this.confirmedPosture === 'CLOSED_HAND') {
-            this.gestureState = 'CLOSED_HAND';
-            this.awaitingFreshMoveAfterFallback = false;
-            break;
-          }
+    _feedGesture(result, dtMs) {
+      this.rawGesture = result;
+      const status = this.stabilizer.update(result.id, dtMs);
+      this.gestureStatus = status;
 
-          // If we just completed a fallback pause-cast while keeping the finger extended,
-          // wait for the player to briefly pause or begin a fresh movement before starting a new stroke
-          if (this.awaitingFreshMoveAfterFallback) {
-            if (this.velocity < this.STILL_SPEED_THRESHOLD * 0.7) {
-              this.awaitingFreshMoveAfterFallback = false;
-            }
-            break;
-          }
-
-          // When index finger is stably extended and moving (beyond cooldown), start a brand-new stroke!
-          if (
-            this.confirmedPosture === 'INDEX_EXTENDED' &&
-            this.rawPosture === 'INDEX_EXTENDED' &&
-            this.cooldownAfterCast <= 0 &&
-            this.velocity >= this.MIN_DRAW_SPEED
-          ) {
-            this.gestureState = 'DRAWING';
-            this.isFingerDrawing = true;
-            this.airStrokePoints = [];
-            this.airStrokeTimes = [];
-            for (const h of this.recentCursorHistory) {
-              const last = this.airStrokePoints[this.airStrokePoints.length - 1];
-              if (!last || Math.hypot(h.x - last[0], h.y - last[1]) >= 2) {
-                this.airStrokePoints.push([h.x, h.y]);
-                this.airStrokeTimes.push(h.t);
-              }
-            }
-            this.airStrokePoints.push(pt);
-            this.airStrokeTimes.push(nowMs);
-            this.recentCursorHistory = [];
-            this.dwellTimer = 0;
-          }
-          break;
-        }
-
-        case 'DRAWING': {
-          this.isFingerDrawing = true;
-
-          // 1. PRIMARY TRIGGER: Explicit Hand-State Transition (Index Extended -> Closed Fist)
-          if (this.confirmedPosture === 'CLOSED_HAND') {
-            this._transitionToFinalizing('CLOSED_HAND');
-            break;
-          }
-
-          // Only append trajectory points while rawPosture is INDEX_EXTENDED.
-          // If rawPosture is CLOSED_HAND (during the 1-2 debounce frames as the player curls
-          // their finger into a fist), we freeze point recording so the curling motion never
-          // distorts the end of the drawn shape!
-          if (this.rawPosture === 'INDEX_EXTENDED') {
-            const last = this.airStrokePoints[this.airStrokePoints.length - 1];
-            const moveDist = last ? Math.hypot(pt[0] - last[0], pt[1] - last[1]) : 0;
-
-            if (!last || moveDist >= 3) {
-              this.airStrokePoints.push(pt);
-              this.airStrokeTimes.push(nowMs);
-            }
-
-            // 2. FALLBACK TRIGGER: Pause-based completion if player holds finger still at end of stroke
-            if (
-              this.velocity < this.STILL_SPEED_THRESHOLD &&
-              this.airStrokePoints.length >= 8 &&
-              this._computeStrokeLength(this.airStrokePoints) >= 60
-            ) {
-              this.dwellTimer += dt;
-              if (this.dwellTimer >= this.DWELL_FINALIZE_SECONDS) {
-                this.awaitingFreshMoveAfterFallback = true;
-                this._transitionToFinalizing('READY');
-                break;
-              }
-            } else {
-              this.dwellTimer = Math.max(0, this.dwellTimer - dt * 2.2);
-            }
-          }
-          break;
-        }
-
-        case 'FINALIZING': {
-          // Safety transition in case update is called while in FINALIZING
-          this.gestureState =
-            this.confirmedPosture === 'CLOSED_HAND' ? 'CLOSED_HAND' : 'READY';
-          this.isFingerDrawing = false;
-          this.airStrokePoints = [];
-          break;
-        }
-
-        default:
-          this._resetGestureStateMachine('READY');
-          break;
+      // Only cast outside the setup flow (setup/countdown just shows live feedback).
+      // Note: closeSetupModal() moves 'ready' back to 'idle', so both mean "in game".
+      const inSetup = this.setupStage !== 'idle' && this.setupStage !== 'ready';
+      if (status.confirmedId && !inSetup) {
+        const hit = this.onGestureConfirmed ? this.onGestureConfirmed(status.confirmedId) : false;
+        this.confirmFlash = { id: status.confirmedId, timer: 0.8, matched: Boolean(hit) };
       }
     }
 
-    /**
-     * Enters the FINALIZING state, copies and submits the recorded gesture path,
-     * immediately clears the active path so two gestures can never merge, and
-     * transitions to nextState ('CLOSED_HAND' or 'READY').
-     */
-    _transitionToFinalizing(nextState) {
-      this.gestureState = 'FINALIZING';
+    // ------------------------------------------------------------------------
+    // 4. PER-FRAME UPDATE
+    // ------------------------------------------------------------------------
+    update(dt, isGameplayActive) {
+      if (!this.isRunning) return;
 
-      const completedPoints = this._prepareStrokeForRecognition(
-        this.airStrokePoints,
-        this.airStrokeTimes,
-        nextState === 'CLOSED_HAND'
-      );
-      const totalLength = this._computeStrokeLength(completedPoints);
-
-      // Immediately clear active drawing path & state
-      this.airStrokePoints = [];
-      this.airStrokeTimes = [];
-      this.closeOnsetTime = 0;
-      this.isFingerDrawing = false;
-      this.dwellTimer = 0;
-      this.cooldownAfterCast = 0.14;
-
-      // Submit to GestureRecognizer if the path represents an intentional drawing
-      if (completedPoints.length >= 3 && totalLength >= 20) {
-        this.submittedFeedbackTimer = 0.75;
-        this.submittedFeedbackPos = completedPoints[completedPoints.length - 1] || [
-          this.screenX,
-          this.screenY
-        ];
-        this.lastSubmittedPointCount = completedPoints.length;
-
-        if (this.onAirStrokeCompleted) {
-          this.onAirStrokeCompleted(completedPoints);
-        }
+      if (this.confirmFlash) {
+        this.confirmFlash.timer -= dt;
+        if (this.confirmFlash.timer <= 0) this.confirmFlash = null;
       }
 
-      // Transition cleanly to the target post-finalization state ('CLOSED_HAND' or 'READY')
-      this.gestureState = nextState;
+      if (this.handDetected && performance.now() - this.lastDetectionTime > this.HAND_LOST_TIMEOUT_MS) {
+        this._markHandLost();
+      }
+      if (!this.handDetected) {
+        this.handLostSeconds += dt;
+      }
+
+      if (this.setupStage !== 'idle' && this.setupStage !== 'ready') {
+        this._updateSetupStateMachine(dt);
+        this._renderSetupCanvas();
+        return;
+      }
+
+      if (isGameplayActive && this.controlMode === 'camera') {
+        if (this.pipContainer) this.pipContainer.classList.remove('hidden');
+        if (this.handLostBanner) this.handLostBanner.classList.toggle('hidden', this.handDetected);
+        this._updatePipStatus();
+        this._renderPipCanvas();
+      }
     }
 
-    /**
-     * Cleans an air-drawn path before recognition:
-     * 1. When finalized by closing the fist, drops the points recorded while the index
-     *    finger was already starting to curl (they add a spurious hook at the end).
-     * 2. Removes near-duplicate points and applies a light moving-average smoothing
-     *    so residual tracking jitter doesn't register as extra corners.
-     */
-    _prepareStrokeForRecognition(points, times, closedByFist) {
-      let pts = points.slice();
-
-      if (closedByFist && times.length === pts.length && this.closeOnsetTime > 0) {
-        const cutoff = this.closeOnsetTime - this.CLOSE_TAIL_TRIM_MS;
-        const totalLen = this._computeStrokeLength(pts);
-        let keep = pts.length;
-        while (keep > 2 && times[keep - 1] > cutoff) {
-          keep--;
-        }
-        // Never trim away more than ~15% of the drawn shape
-        const trimmed = pts.slice(0, keep);
-        if (this._computeStrokeLength(trimmed) >= totalLen * 0.85) {
-          pts = trimmed;
-        }
-      }
-
-      // Drop points closer than 2px to their predecessor
-      const dedup = [];
-      for (const p of pts) {
-        const last = dedup[dedup.length - 1];
-        if (!last || Math.hypot(p[0] - last[0], p[1] - last[1]) >= 2) {
-          dedup.push(p);
-        }
-      }
-      if (dedup.length < 5) return dedup;
-
-      // 3-point weighted moving average (endpoints preserved)
-      const smoothed = [dedup[0]];
-      for (let i = 1; i < dedup.length - 1; i++) {
-        smoothed.push([
-          (dedup[i - 1][0] + dedup[i][0] * 2 + dedup[i + 1][0]) / 4,
-          (dedup[i - 1][1] + dedup[i][1] * 2 + dedup[i + 1][1]) / 4
-        ]);
-      }
-      smoothed.push(dedup[dedup.length - 1]);
-      return smoothed;
-    }
-
-    _computeStrokeLength(points) {
-      let len = 0;
-      for (let i = 1; i < points.length; i++) {
-        len += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
-      }
-      return len;
-    }
-
-    /**
-     * Legacy alias kept for compatibility.
-     */
-    _finalizeAirStroke() {
-      const nextState = this.confirmedPosture === 'CLOSED_HAND' ? 'CLOSED_HAND' : 'READY';
-      this._transitionToFinalizing(nextState);
+    _markHandLost() {
+      this.handDetected = false;
+      this.confidence = 0;
+      this.landmarks = null;
+      this.classifier.reset();
+      this.stabilizer.reset();
+      this.rawGesture = { id: 'UNKNOWN', score: 0, reason: 'no_hand', fingers: null, scores: [] };
+      this.gestureStatus = { phase: 'idle', candidateId: null, latchedId: null, progress: 0 };
     }
 
     /**
@@ -1180,9 +585,67 @@ window.Aetherward = window.Aetherward || {};
       );
     }
 
+    /**
+     * Gesture currently being held/verified (for highlighting matching balloons).
+     */
+    getVerifyingGesture() {
+      if (!this.isRunning || this.gestureStatus.phase !== 'verifying') return null;
+      return { id: this.gestureStatus.candidateId, progress: this.gestureStatus.progress };
+    }
+
     // ------------------------------------------------------------------------
-    // 5. VISUALIZATION (Setup Canvas, In-Game PiP, and Game Screen Cursor)
+    // 5. FEEDBACK & VISUALIZATION
     // ------------------------------------------------------------------------
+    _gestureLabel(id) {
+      const g = Gestures.DEFINITIONS[id];
+      return g ? `${g.emoji} ${g.name}` : '';
+    }
+
+    _updatePipStatus() {
+      if (!this.pipConfidenceText || !this.pipStateDot) return;
+      const st = this.gestureStatus;
+      let dot = '#38bdf8';
+      let header = 'TRACKING';
+      let label = 'Show a gesture';
+      let fill = 0;
+      let fillColor = '#fde047';
+
+      if (!this.handDetected) {
+        dot = '#ef4444';
+        header = 'HAND LOST';
+        label = 'Show your hand';
+      } else if (this.confirmFlash) {
+        dot = this.confirmFlash.matched ? '#4ade80' : '#94a3b8';
+        header = this.confirmFlash.matched ? 'CONFIRMED ✓' : 'NO TARGET';
+        label = this._gestureLabel(this.confirmFlash.id);
+        fill = 1;
+        fillColor = this.confirmFlash.matched ? '#4ade80' : '#64748b';
+      } else if (st.phase === 'verifying') {
+        dot = '#fde047';
+        header = 'HOLD…';
+        label = `Detected: ${this._gestureLabel(st.candidateId)}`;
+        fill = st.progress;
+      } else if (st.phase === 'latched') {
+        dot = '#a78bfa';
+        header = 'CHANGE POSE';
+        label = `${this._gestureLabel(st.latchedId)} ✓`;
+      } else if (this.rawGesture.reason === 'partial') {
+        dot = '#f59e0b';
+        label = 'Move hand fully into view';
+      } else if (this.rawGesture.reason === 'too_far') {
+        dot = '#f59e0b';
+        label = 'Move a bit closer';
+      }
+
+      this.pipConfidenceText.textContent = header;
+      this.pipStateDot.style.background = dot;
+      if (this.pipGestureLabel) this.pipGestureLabel.textContent = label;
+      if (this.pipHoldFill) {
+        this.pipHoldFill.style.width = `${Math.round(fill * 100)}%`;
+        this.pipHoldFill.style.background = fillColor;
+      }
+    }
+
     _renderSetupCanvas() {
       if (!this.setupCtx || !this.setupCanvas) return;
       const ctx = this.setupCtx;
@@ -1190,95 +653,46 @@ window.Aetherward = window.Aetherward || {};
       const h = this.setupCanvas.height;
 
       ctx.clearRect(0, 0, w, h);
-
-      // 1. Draw Mirrored Webcam Video Feed
       if (this.videoEl && this.videoEl.readyState >= 2) {
         ctx.save();
         ctx.translate(w, 0);
-        ctx.scale(-1, 1);
+        ctx.scale(-1, 1); // Mirror so the preview behaves like a mirror
         ctx.drawImage(this.videoEl, 0, 0, w, h);
         ctx.restore();
       } else {
         ctx.fillStyle = '#090d1a';
         ctx.fillRect(0, 0, w, h);
       }
-
-      // Dark translucent tint for high-contrast overlays
       ctx.fillStyle = 'rgba(9, 13, 26, 0.32)';
       ctx.fillRect(0, 0, w, h);
 
-      // 2. Draw Calibration Waypoints & Trail during Calibration Stage
-      if (this.setupStage === 'calibrate') {
-        if (this.calibrationTrail.length >= 2) {
-          ctx.save();
-          ctx.strokeStyle = '#38bdf8';
-          ctx.shadowColor = '#38bdf8';
-          ctx.shadowBlur = 12;
-          ctx.lineWidth = 5;
-          ctx.lineCap = 'round';
-          ctx.beginPath();
-          this.calibrationTrail.forEach(([nx, ny], i) => {
-            if (i === 0) ctx.moveTo(nx * w, ny * h);
-            else ctx.lineTo(nx * w, ny * h);
-          });
-          ctx.stroke();
-          ctx.restore();
-        }
-
-        // Draw target rings 1 -> 2 -> 3
-        this.calibrationWaypoints.forEach(wp => {
-          const cx = wp.nx * w;
-          const cy = wp.ny * h;
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(cx, cy, 24, 0, Math.PI * 2);
-          ctx.fillStyle = wp.reached ? 'rgba(74, 222, 128, 0.35)' : 'rgba(56, 189, 248, 0.22)';
-          ctx.strokeStyle = wp.reached ? '#4ade80' : '#fde047';
-          ctx.lineWidth = 3;
-          ctx.fill();
-          ctx.stroke();
-
-          ctx.fillStyle = '#ffffff';
-          ctx.font = '800 16px Fredoka, system-ui, sans-serif';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(wp.reached ? '✓' : wp.label, cx, cy);
-          ctx.restore();
-        });
+      // Framing guide: dashed box where the hand should be
+      if (this.setupStage === 'detect_hand') {
+        ctx.save();
+        ctx.strokeStyle = this.handDetected ? '#4ade80' : 'rgba(253, 224, 71, 0.85)';
+        ctx.setLineDash([10, 8]);
+        ctx.lineWidth = 3;
+        ctx.strokeRect(w * 0.2, h * 0.12, w * 0.6, h * 0.76);
+        ctx.restore();
       }
 
-      // 3. Draw Hand Skeleton & Index Fingertip Marker
       this._drawHandOverlayOnCanvas(ctx, w, h, true);
+
+      // Live feedback so players can try gestures before the game starts
+      if (this.handDetected && this.rawGesture.id !== 'UNKNOWN') {
+        ctx.save();
+        ctx.font = '800 20px Fredoka, system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.8)';
+        ctx.fillRect(w / 2 - 130, h - 44, 260, 32);
+        ctx.fillStyle = '#f8fafc';
+        ctx.fillText(`Detected: ${this._gestureLabel(this.rawGesture.id)}`, w / 2, h - 21);
+        ctx.restore();
+      }
     }
 
     _renderPipCanvas() {
-      if (!this.pipCtx || !this.pipCanvas) return;
-
-      // Update status badge on PiP header with explicit gesture state feedback
-      if (this.pipConfidenceText && this.pipStateDot) {
-        if (this.handDetected) {
-          const pct = Math.round(this.confidence * 100);
-          if (this.submittedFeedbackTimer > 0) {
-            this.pipConfidenceText.textContent = `SUBMITTED ✓ (${pct}%)`;
-            this.pipStateDot.style.background = '#4ade80';
-          } else if (this.gestureState === 'DRAWING') {
-            this.pipConfidenceText.textContent = `DRAWING (${pct}%)`;
-            this.pipStateDot.style.background = '#fde047';
-          } else if (this.gestureState === 'CLOSED_HAND') {
-            this.pipConfidenceText.textContent = `CLOSED HAND (${pct}%)`;
-            this.pipStateDot.style.background = '#f59e0b';
-          } else {
-            this.pipConfidenceText.textContent = `READY (${pct}%)`;
-            this.pipStateDot.style.background = '#38bdf8';
-          }
-        } else {
-          this.pipConfidenceText.textContent = 'HAND LOST';
-          this.pipStateDot.style.background = '#ef4444';
-        }
-      }
-
-      if (!this.settings.showSkeletonOverlay) return;
-
+      if (!this.settings.showSkeletonOverlay || !this.pipCtx || !this.pipCanvas) return;
       const ctx = this.pipCtx;
       const w = this.pipCanvas.width;
       const h = this.pipCanvas.height;
@@ -1298,205 +712,89 @@ window.Aetherward = window.Aetherward || {};
       }
 
       this._drawHandOverlayOnCanvas(ctx, w, h, false);
+      if (this.debugMode) this._drawDebugOverlay(ctx, w, h);
     }
 
     _drawHandOverlayOnCanvas(ctx, w, h, isLargeSetup) {
-      if (!this.handDetected) return;
+      if (!this.handDetected || !this.landmarks) return;
+      const lm = this.landmarks;
+      const st = this.gestureStatus;
+
+      let color = 'rgba(56, 189, 248, 0.85)';
+      if (this.confirmFlash && this.confirmFlash.matched) color = 'rgba(74, 222, 128, 0.95)';
+      else if (st.phase === 'verifying') color = 'rgba(253, 224, 71, 0.9)';
 
       ctx.save();
-
-      const isClosed = this.gestureState === 'CLOSED_HAND';
-      const skeletonColor = isClosed
-        ? 'rgba(245, 158, 11, 0.82)'
-        : 'rgba(56, 189, 248, 0.78)';
-
-      // Draw 21-point hand skeleton if landmarks are available
-      if (this.landmarks) {
-        ctx.strokeStyle = skeletonColor;
-        ctx.lineWidth = isLargeSetup ? 2.8 : 1.8;
-
-        for (const [i, j] of HAND_CONNECTIONS) {
-          const a = this.landmarks[i];
-          const b = this.landmarks[j];
-          ctx.beginPath();
-          ctx.moveTo((1 - a.x) * w, a.y * h);
-          ctx.lineTo((1 - b.x) * w, b.y * h);
-          ctx.stroke();
-        }
-
-        for (let i = 0; i < this.landmarks.length; i++) {
-          const lm = this.landmarks[i];
-          const lx = (1 - lm.x) * w;
-          const ly = lm.y * h;
-          ctx.fillStyle = i === 8 ? (isClosed ? '#f59e0b' : '#fde047') : '#38bdf8';
-          ctx.beginPath();
-          ctx.arc(
-            lx,
-            ly,
-            i === 8 ? (isLargeSetup ? 7 : 4.5) : (isLargeSetup ? 3.5 : 2),
-            0,
-            Math.PI * 2
-          );
-          ctx.fill();
-        }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isLargeSetup ? 2.8 : 1.8;
+      for (const [i, j] of HAND_CONNECTIONS) {
+        ctx.beginPath();
+        ctx.moveTo((1 - lm[i].x) * w, lm[i].y * h);
+        ctx.lineTo((1 - lm[j].x) * w, lm[j].y * h);
+        ctx.stroke();
       }
 
-      // Highlight mapped cursor position
-      const nx = this.screenX / Math.max(1, window.innerWidth);
-      const ny = this.screenY / Math.max(1, window.innerHeight);
-      const cx = nx * w;
-      const cy = ny * h;
+      // Fingertips colored by state (green = extended, amber = partial, red = folded)
+      const fingers = this.rawGesture.fingers;
+      const tips = [4, 8, 12, 16, 20];
+      for (let i = 0; i < lm.length; i++) {
+        let fill = '#38bdf8';
+        const tipIdx = tips.indexOf(i);
+        if (tipIdx >= 0 && fingers) {
+          const s = fingers[FINGER_NAMES[tipIdx]].state;
+          fill = s === 'extended' ? '#4ade80' : s === 'partial' ? '#f59e0b' : '#ef4444';
+        }
+        ctx.fillStyle = fill;
+        ctx.beginPath();
+        ctx.arc((1 - lm[i].x) * w, lm[i].y * h, tipIdx >= 0 ? (isLargeSetup ? 6 : 3.5) : (isLargeSetup ? 3.5 : 2), 0, Math.PI * 2);
+        ctx.fill();
+      }
 
-      ctx.strokeStyle = isClosed ? '#f59e0b' : '#fde047';
-      ctx.shadowColor = isClosed ? '#f59e0b' : '#fde047';
-      ctx.shadowBlur = 10;
-      ctx.lineWidth = 2.5;
-      ctx.beginPath();
-      ctx.arc(cx, cy, isLargeSetup ? 12 : 7, 0, Math.PI * 2);
-      ctx.stroke();
+      // Hold-progress ring around the palm
+      if (st.phase === 'verifying' || (this.confirmFlash && this.confirmFlash.matched)) {
+        const cx = (1 - (lm[0].x + lm[9].x) / 2) * w;
+        const cy = ((lm[0].y + lm[9].y) / 2) * h;
+        const r = Math.max(isLargeSetup ? 26 : 12, Math.hypot((lm[9].x - lm[0].x) * w, (lm[9].y - lm[0].y) * h) * 0.9);
+        const p = st.phase === 'verifying' ? st.progress : 1;
+        ctx.lineWidth = isLargeSetup ? 5 : 3;
+        ctx.strokeStyle = 'rgba(15, 23, 42, 0.6)';
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = st.phase === 'verifying' ? '#fde047' : '#4ade80';
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
 
+    _drawDebugOverlay(ctx, w, h) {
+      const r = this.rawGesture;
+      ctx.save();
+      ctx.fillStyle = 'rgba(2, 6, 23, 0.72)';
+      ctx.fillRect(0, 0, w, h);
+      ctx.font = '600 9.5px ui-monospace, Consolas, monospace';
+      ctx.fillStyle = '#e2e8f0';
+      let y = 12;
+      const line = t => { ctx.fillText(t, 5, y); y += 11; };
+      line(`raw: ${r.id} (${r.reason})`);
+      if (r.fingers) {
+        line(FINGER_NAMES.map(n => `${n[0].toUpperCase()}${r.fingers[n].ext.toFixed(2)}`).join(' '));
+      }
+      if (r.measures) {
+        line(`pinch ${r.measures.pinch.toFixed(2)} thumbUp ${r.measures.thumbUp.toFixed(2)}`);
+      }
+      for (const s of (r.scores || []).slice(0, 3)) line(`${s.id.padEnd(11)} ${s.score.toFixed(2)}`);
+      line(`${this.gestureStatus.phase} ${Math.round(this.gestureStatus.progress * 100)}%`);
       ctx.restore();
     }
 
     /**
-     * Renders the real-time index fingertip cursor, active air-drawn stroke,
-     * and explicit hand-state indicator (DRAWING / CLOSED HAND / READY)
-     * directly onto the main fullscreen game canvas.
+     * Main game canvas overlay: nothing is drawn here in gesture mode (feedback
+     * lives in the PiP widget and on the targeted balloons); kept for API compatibility.
      */
-    renderOnGameCanvas(ctx) {
-      if (this.controlMode !== 'camera' || !this.isRunning) return;
-
-      // 1. Render active air-drawn stroke trail ONLY when in DRAWING state
-      if (this.gestureState === 'DRAWING' && this.airStrokePoints.length >= 2) {
-        ctx.save();
-        ctx.strokeStyle = '#fde047';
-        ctx.shadowColor = '#f59e0b';
-        ctx.shadowBlur = 20;
-        ctx.lineWidth = 8.5;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.beginPath();
-        for (let i = 0; i < this.airStrokePoints.length; i++) {
-          const [x, y] = this.airStrokePoints[i];
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
-        ctx.stroke();
-
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 3;
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      // 2. Render expanding "Gesture Submitted" pulse ring when a gesture is finalized
-      if (this.submittedFeedbackTimer > 0 && this.submittedFeedbackPos) {
-        const [sx, sy] = this.submittedFeedbackPos;
-        const progress = 1 - this.submittedFeedbackTimer / 0.75;
-        const radius = 16 + progress * 38;
-        const alpha = Math.max(0, 1 - progress);
-
-        ctx.save();
-        ctx.strokeStyle = `rgba(74, 222, 128, ${alpha.toFixed(2)})`;
-        ctx.shadowColor = '#4ade80';
-        ctx.shadowBlur = 16;
-        ctx.lineWidth = 3.5;
-        ctx.beginPath();
-        ctx.arc(sx, sy, radius, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      // 3. Render Index Fingertip Arcane Cursor Reticle & State Pill
-      if (!this.handDetected) return;
-
-      ctx.save();
-      const x = this.screenX;
-      const y = this.screenY;
-
-      let ringColor = '#38bdf8'; // READY (cyan)
-      let statusLabel = '☝️ READY — DRAW WITH INDEX FINGER';
-      let pillBg = 'rgba(15, 23, 42, 0.82)';
-      let pillBorder = '#38bdf8';
-
-      if (this.gestureState === 'DRAWING') {
-        ringColor = '#fde047'; // DRAWING (gold)
-        statusLabel = '✏️ DRAWING — CLOSE FIST ✊ TO SUBMIT';
-        pillBorder = '#fde047';
-      } else if (this.gestureState === 'CLOSED_HAND') {
-        if (this.submittedFeedbackTimer > 0) {
-          ringColor = '#4ade80'; // Just submitted!
-          statusLabel = '✓ GESTURE SUBMITTED — OPEN FINGER ☝️';
-          pillBorder = '#4ade80';
-        } else {
-          ringColor = '#f59e0b'; // Holding closed fist (repositioning without drawing)
-          statusLabel = '✊ HAND CLOSED — OPEN FINGER ☝️ TO DRAW';
-          pillBorder = '#f59e0b';
-        }
-      } else if (this.submittedFeedbackTimer > 0) {
-        ringColor = '#4ade80';
-        statusLabel = '✓ GESTURE SUBMITTED — READY';
-        pillBorder = '#4ade80';
-      }
-
-      // Outer glowing cursor ring (dashed/compact when CLOSED_HAND, solid when READY/DRAWING)
-      ctx.strokeStyle = ringColor;
-      ctx.shadowColor = ringColor;
-      ctx.shadowBlur = 14;
-      ctx.lineWidth = 3;
-      if (this.gestureState === 'CLOSED_HAND') {
-        ctx.setLineDash([4, 4]);
-      }
-      ctx.beginPath();
-      ctx.arc(x, y, this.gestureState === 'CLOSED_HAND' ? 11 : 15, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Inner fingertip dot
-      ctx.fillStyle = this.gestureState === 'CLOSED_HAND' ? ringColor : '#ffffff';
-      ctx.beginPath();
-      ctx.arc(x, y, 4.5, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Fallback dwell progress arc when pausing finger to finalize stroke
-      if (this.gestureState === 'DRAWING' && this.dwellTimer > 0.04) {
-        const progress = Math.min(1, this.dwellTimer / this.DWELL_FINALIZE_SECONDS);
-        ctx.strokeStyle = '#4ade80';
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.arc(x, y, 21, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
-        ctx.stroke();
-      }
-
-      // Floating State Badge Pill near the cursor (clamped inside screen bounds)
-      ctx.shadowBlur = 0;
-      ctx.font = '700 11.5px Nunito, system-ui, sans-serif';
-      const textWidth = ctx.measureText(statusLabel).width;
-      const padX = 10;
-      const pillW = textWidth + padX * 2;
-      const pillH = 22;
-      const pillX = Math.max(8, Math.min(window.innerWidth - pillW - 8, x - pillW / 2));
-      const pillY = y > 55 ? y - 38 : y + 22;
-
-      ctx.fillStyle = pillBg;
-      ctx.strokeStyle = pillBorder;
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      if (ctx.roundRect) {
-        ctx.roundRect(pillX, pillY, pillW, pillH, 11);
-      } else {
-        ctx.rect(pillX, pillY, pillW, pillH);
-      }
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = '#f8fafc';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(statusLabel, pillX + pillW / 2, pillY + pillH / 2 + 0.5);
-
-      ctx.restore();
-    }
+    renderOnGameCanvas() {}
   }
 
   window.Aetherward.CameraController = CameraController;

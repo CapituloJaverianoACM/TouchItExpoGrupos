@@ -51,7 +51,7 @@
         </button>
         <button type="button" class="mode-btn js-select-control" data-control="camera">
           <strong>📷 Camera Control</strong>
-          <span>Index Finger Tracking</span>
+          <span>Hand Gestures</span>
         </button>
       </div>
 
@@ -134,7 +134,7 @@
       <div class="hud-center-alerts">
         <div id="hud-hand-lost-banner" class="hand-lost-banner hidden">
           <strong>🖐️ HAND LOST — SHOW YOUR HAND</strong>
-          <span>Hold your index finger in front of the camera to resume casting</span>
+          <span>Hold your hand in front of the camera to resume casting</span>
         </div>
         <div id="hud-wave-banner" class="wave-banner hidden">
           <h2 id="hud-banner-title">Phase I: Dawn Breeze</h2>
@@ -160,6 +160,10 @@
             </div>
           </div>
           <canvas id="camera-pip-canvas" width="176" height="132"></canvas>
+          <div class="pip-gesture-row">
+            <span id="pip-gesture-label">Show a gesture</span>
+            <div class="pip-hold-track"><div id="pip-hold-fill"></div></div>
+          </div>
         </div>
 
         <div id="hud-active-powerups" class="active-powerups-row"></div>
@@ -178,12 +182,12 @@
        ====================================================================== -->
   <div id="modal-camera-setup" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="camera-setup-headline">
     <div class="modal-window arcade-cabinet-window" style="max-width: 580px; text-align: center;">
-      <span id="camera-setup-stage-badge" class="game-badge arcade-badge">STEP 1 OF 3 • CAMERA SETUP</span>
+      <span id="camera-setup-stage-badge" class="game-badge arcade-badge">STEP 1 OF 2 • CAMERA SETUP</span>
       <h2 id="camera-setup-headline" class="arcade-title" style="font-size: 1.7rem; margin-top: 6px;">
         SHOW YOUR HAND TO THE CAMERA
       </h2>
       <p id="camera-setup-subtext" class="arcade-subtext" style="margin-bottom: 14px;">
-        Point your index finger in front of the webcam to calibrate arcane air-drawing.
+        Hold one hand up in front of the webcam.
       </p>
 
       <!-- Progress Bar -->
@@ -200,15 +204,16 @@
       <div class="camera-privacy-note">
         🔒 <strong>Privacy Guaranteed:</strong> Camera tracking runs 100% locally in your browser. No video is ever recorded or uploaded.
         <br />
-        💡 <strong>How to Draw in Air:</strong> <strong>☝️ Open Index Finger</strong> to draw → <strong>✊ Close Hand into a Fist</strong> to submit → <strong>☝️ Open Index Finger</strong> for the next symbol!
+        💡 <strong>How to Cast:</strong> copy the hand gesture shown on a balloon and <strong>hold it for a moment</strong> until the ring fills. Then change pose for the next one!
       </div>
+
+      <!-- Gesture reference panel (filled by js/camera.js) -->
+      <div class="gesture-guide-title">Gestures you'll need</div>
+      <div id="camera-gesture-guide" class="gesture-guide-grid"></div>
 
       <div class="menu-secondary-row" style="margin-top: 14px;">
         <button type="button" id="btn-cancel-camera-setup" class="btn btn-secondary">
           ✕ Cancel
-        </button>
-        <button type="button" id="btn-skip-calibration" class="btn btn-arcade hidden">
-          ⚡ Skip to Countdown
         </button>
       </div>
     </div>
@@ -364,7 +369,7 @@
       <div class="grimoire-intro">
         <div class="grimoire-rules">
           <p><strong>🎯 Core Mechanic:</strong> Draw the rune shown on an enemy's balloon using your mouse, touchscreen, or <strong>📷 Camera Finger Tracking</strong>!</p>
-          <p><strong>🖐️ Camera Air-Drawing:</strong> In Camera Mode, point your index finger and move it in the air to trace a rune. Pause briefly at the end of the shape (or curl your finger) to cast!</p>
+          <p><strong>🖐️ Camera Hand Gestures:</strong> In Camera Mode, balloons show hand poses instead of runes (✊ ✌️ 🖐️ ☝️ 🤘 👍…). Copy the pose in front of the webcam and hold it briefly to cast!</p>
           <p><strong>⚡ Multi-Cast &amp; Combos:</strong> If multiple enemies share the same rune, one drawing pops <em>all</em> of them simultaneously for a massive Multi-Cast bonus!</p>
           <p><strong>🔒 Ordered &amp; Decoy Balloons:</strong> Pop numbered balloons in order (start with <strong>#1</strong>), and ignore the dashed flickering decoy balloon on <em>Mirror Tricksters</em>!</p>
         </div>
@@ -473,12 +478,13 @@
 
         <div class="setting-row">
           <label for="setting-cam-gesture">
-            Camera Air-Draw Trigger
-            <small>How to start and finalize symbols in the air</small>
+            Camera: Gesture Hold Time
+            <small>How long a hand pose must be held before it casts</small>
           </label>
           <select id="setting-cam-gesture">
-            <option value="point_dwell">Open Index → Draw → Close Fist (Default)</option>
-            <option value="pinch">Thumb-Index Pinch</option>
+            <option value="fast">Fast (0.2 s)</option>
+            <option value="normal">Normal (0.3 s, Default)</option>
+            <option value="relaxed">Relaxed (0.45 s)</option>
           </select>
         </div>
 
@@ -581,12 +587,14 @@
   <!-- Modular Game Scripts (Ordered for both file:// and HTTP server compatibility) -->
   <script defer src="js/config.js"></script>
   <script defer src="js/symbols.js"></script>
+  <script defer src="js/gestures.js"></script>
   <script defer src="js/recognizer.js"></script>
   <script defer src="js/audio.js"></script>
   <script defer src="js/particles.js"></script>
   <script defer src="js/entities.js"></script>
   <script defer src="js/spawner.js"></script>
   <script defer src="js/leaderboard.js"></script>
+  <script defer src="js/handpose.js"></script>
   <script defer src="js/camera.js"></script>
   <script defer src="js/ui.js"></script>
   <script defer src="js/game.js"></script>

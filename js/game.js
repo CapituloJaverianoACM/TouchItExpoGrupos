@@ -27,11 +27,10 @@ window.Aetherward = window.Aetherward || {};
       this.camera = new window.Aetherward.CameraController(this.audio);
       this.ui = new window.Aetherward.UIManager(this.audio, this.recognizer);
 
-      // Connect Camera air-drawing strokes to the main Gesture Recognizer
-      this.camera.onAirStrokeCompleted = strokePoints => {
-        if (this.state === 'playing') {
-          this._evaluateDrawnStroke(strokePoints, true, true);
-        }
+      // Connect confirmed camera hand gestures to the combat system
+      this.camera.onGestureConfirmed = gestureId => {
+        if (this.state !== 'playing') return false;
+        return this._castGesture(gestureId);
       };
 
       // Sync initial settings
@@ -90,7 +89,7 @@ window.Aetherward = window.Aetherward || {};
       this.selectedTheme = settings.theme || 'dynamic';
       if (this.camera) {
         this.camera.settings.pauseOnHandLost = settings.camPauseOnLost !== false;
-        this.camera.settings.gestureMode = settings.camGestureMode || 'point_dwell';
+        this.camera.applyHoldTime(settings.camHoldTime || 'normal');
       }
     }
 
@@ -289,6 +288,9 @@ window.Aetherward = window.Aetherward || {};
           }
         }
 
+        // In camera gesture mode balloons show hand poses, so drawn runes can't match anything
+        if (this.spawner.symbolSet === 'gesture') return;
+
         this.isDrawing = true;
         this.activePointerId = e.pointerId;
         this.currentStroke = [[x, y]];
@@ -372,7 +374,36 @@ window.Aetherward = window.Aetherward || {};
         return;
       }
 
+      this._castSymbol(result.symbolId, result.confidence, points, activeSymbols);
+    }
+
+    /**
+     * Camera Mode: a hand gesture was held long enough to be confirmed.
+     * Confirmed poses with no matching balloon are ignored without penalty
+     * (the player's hand is always in some pose), so only real hits count.
+     * @returns {boolean} true if the gesture hit a balloon, orb or decoy
+     */
+    _castGesture(gestureId) {
+      const activeSymbols = this._getActiveSymbolSet();
+      if (!activeSymbols.has(gestureId)) {
+        const sym = Symbols.DEFINITIONS[gestureId];
+        if (sym) this.ui.showRecognitionFeedback(`${sym.emoji} ${sym.name} — no target`, false);
+        return false;
+      }
+      this.strokesAttempted++;
+      // Held poses are exact matches: award full accuracy
+      this._castSymbol(gestureId, 1.0, [], activeSymbols);
+      return true;
+    }
+
+    /**
+     * Applies a recognized symbol (drawn rune or confirmed hand gesture):
+     * collects matching orbs and pops every matching balloon on screen.
+     */
+    _castSymbol(symbolId, confidence, points, activeSymbols) {
+      const result = { symbolId, confidence };
       const matchedSym = Symbols.DEFINITIONS[result.symbolId];
+      const castLabel = matchedSym.emoji ? `${matchedSym.emoji} ${matchedSym.name}` : matchedSym.name;
       let balloonsPopped = 0;
       let enemiesDefeatedThisStroke = 0;
       let decoyHit = false;
@@ -443,7 +474,7 @@ window.Aetherward = window.Aetherward || {};
         }
 
         this.wizard.triggerCast(matchedSym.color);
-        this.ui.showRecognitionFeedback(`✓ ${matchedSym.name}`, true);
+        this.ui.showRecognitionFeedback(`✓ ${castLabel}`, true);
         this.fadingStrokes.push({
           points,
           color: matchedSym.color,
@@ -451,7 +482,10 @@ window.Aetherward = window.Aetherward || {};
           isSuccess: true
         });
       } else if (decoyHit) {
-        this.ui.showRecognitionFeedback(`Trickster Decoy! Draw the solid balloon!`, false);
+        this.ui.showRecognitionFeedback(
+          matchedSym.isGesture ? 'Trickster Decoy! Match the solid balloon!' : 'Trickster Decoy! Draw the solid balloon!',
+          false
+        );
         this.fadingStrokes.push({
           points,
           color: '#c084fc',
@@ -683,6 +717,8 @@ window.Aetherward = window.Aetherward || {};
       this.currentStroke = [];
       this.fadingStrokes = [];
 
+      const useGestures = Boolean(this.camera && this.camera.isCameraModeEnabled());
+      this.spawner.setSymbolSet(useGestures ? 'gesture' : 'rune');
       this.spawner.reset(mode);
       this.audio.setDifficultyPhase(0);
       this.audio.startMusic();
@@ -700,7 +736,8 @@ window.Aetherward = window.Aetherward || {};
       };
       this.ui.showWaveBanner(
         modeTitles[mode] || 'Phase I: Dawn Breeze',
-        subTitles[mode] || 'Draw the runes to pop the balloons!'
+        subTitles[mode] ||
+          (useGestures ? 'Copy the hand gesture on a balloon and hold it!' : 'Draw the runes to pop the balloons!')
       );
     }
 
@@ -818,18 +855,6 @@ window.Aetherward = window.Aetherward || {};
         dt = rawDt * 0.35;
       }
 
-      // Allow camera index fingertip to touch/slice floating Power-Up Orbs directly
-      if (this.camera && this.camera.isCameraModeEnabled() && this.camera.handDetected) {
-        const fx = this.camera.screenX;
-        const fy = this.camera.screenY;
-        for (let i = this.powerupOrbs.length - 1; i >= 0; i--) {
-          const orb = this.powerupOrbs[i];
-          if (Math.hypot(orb.x - fx, orb.y - fy) <= orb.radius + 18) {
-            this.collectPowerUpOrb(orb, i);
-          }
-        }
-      }
-
       this.elapsedSeconds += dt;
 
       // Check survival time achievements & Rush Overtime transition
@@ -881,7 +906,13 @@ window.Aetherward = window.Aetherward || {};
               },
               onMiniBossSpawn: () => {
                 this.audio.playBossWarning();
-                this.ui.showWaveBanner('⚠️ DREADNOUGHT ZEPPELIN! ⚠️', 'Pop its sequential runes before impact!', true);
+                this.ui.showWaveBanner(
+                  '⚠️ DREADNOUGHT ZEPPELIN! ⚠️',
+                  this.spawner.symbolSet === 'gesture'
+                    ? 'Pop its balloons in order (#1 first) before impact!'
+                    : 'Pop its sequential runes before impact!',
+                  true
+                );
               }
             }
           );
@@ -1035,11 +1066,46 @@ window.Aetherward = window.Aetherward || {};
       // 6. Player Gesture Ink Trail (Active + Fading)
       this._renderGestureTrails(ctx);
 
-      // 7. Camera Index Fingertip Cursor & Air-Drawing Trail
-      if (this.camera) {
-        this.camera.renderOnGameCanvas(ctx);
-      }
+      // 7. Camera gesture hold-progress rings on the balloons that the held pose targets
+      this._renderGestureTargetRings(ctx);
 
+      ctx.restore();
+    }
+
+    _renderGestureTargetRings(ctx) {
+      if (!this.camera || this.spawner.symbolSet !== 'gesture') return;
+      const verifying = this.camera.getVerifyingGesture();
+      if (!verifying) return;
+
+      const drawRing = (x, y, r) => {
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(15, 23, 42, 0.6)';
+        ctx.lineWidth = 5;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x, y, r, -Math.PI / 2, -Math.PI / 2 + verifying.progress * Math.PI * 2);
+        ctx.strokeStyle = '#fde047';
+        ctx.lineWidth = 4;
+        ctx.stroke();
+      };
+
+      ctx.save();
+      ctx.shadowColor = '#fde047';
+      ctx.shadowBlur = 10;
+      for (const enemy of this.enemies) {
+        if (enemy.state !== 'descending') continue;
+        const limit = enemy.orderedBalloons ? Math.min(1, enemy.balloons.length) : enemy.balloons.length;
+        for (let i = 0; i < limit; i++) {
+          const b = enemy.balloons[i];
+          if (b.symbolId === verifying.id) {
+            drawRing(enemy.x + b.offsetX, enemy.y + b.offsetY, b.radius + 9);
+          }
+        }
+      }
+      for (const orb of this.powerupOrbs) {
+        if (orb.symbolId === verifying.id) drawRing(orb.x, orb.y, orb.radius + 8);
+      }
       ctx.restore();
     }
 

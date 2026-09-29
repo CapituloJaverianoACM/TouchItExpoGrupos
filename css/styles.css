@@ -1268,6 +1268,88 @@ html, body {
   height: auto;
 }
 
+/* PiP gesture feedback: detected pose + hold progress */
+.pip-gesture-row {
+  padding: 5px 8px 7px;
+  background: rgba(15, 23, 42, 0.95);
+  border-top: 1px solid rgba(56, 189, 248, 0.25);
+}
+
+#pip-gesture-label {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+}
+
+.pip-hold-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(51, 65, 85, 0.9);
+  overflow: hidden;
+}
+
+#pip-hold-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--gold-bright);
+  transition: width 0.08s linear;
+}
+
+/* Camera setup: gesture reference panel */
+#modal-camera-setup .camera-setup-viewport {
+  max-width: 400px;
+}
+
+.gesture-guide-title {
+  margin-top: 12px;
+  font-family: var(--font-display);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--gold-bright);
+}
+
+.gesture-guide-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.gesture-guide-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 4px;
+  background: rgba(15, 23, 42, 0.78);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 12px;
+}
+
+.gesture-guide-card canvas {
+  width: 56px;
+  height: 56px;
+}
+
+.gesture-guide-card strong {
+  font-size: 0.72rem;
+  color: var(--text-main);
+  text-align: center;
+}
+
+.gesture-guide-card span {
+  font-size: 0.64rem;
+  color: var(--text-muted);
+}
+
 /* Hand Lost Alert Banner */
 .hand-lost-banner {
   background: rgba(127, 29, 29, 0.92);

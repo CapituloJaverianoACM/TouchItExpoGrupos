@@ -320,6 +320,20 @@ window.Aetherward.CONFIG = {
   },
 
   // --------------------------------------------------------------------------
+  // CAMERA HAND-GESTURE RECOGNITION (js/handpose.js)
+  // --------------------------------------------------------------------------
+  GESTURE_RECOGNITION: {
+    HOLD_SECONDS: 0.3,          // How long a pose must stay stable before it is confirmed
+    GRACE_MS: 140,              // Brief flickers (other pose / UNKNOWN) tolerated without resetting the hold
+    RELEASE_MS: 220,            // A confirmed pose must be released this long before it can fire again
+    COOLDOWN_SECONDS: 0.3,      // Minimum gap between two confirmations
+    MIN_SCORE: 0.6,             // Minimum pose match score (0..1); below this the pose is UNKNOWN
+    MIN_MARGIN: 0.12,           // Best pose must beat the runner-up by this much, otherwise UNKNOWN
+    STICKY_BONUS: 0.08,         // Hysteresis: bonus for the pose recognized on the previous frame
+    FINGER_SMOOTHING: 0.55,     // EMA weight of the newest frame for per-finger extension values
+  },
+
+  // --------------------------------------------------------------------------
   // VISUAL THEMES (Selectable in Settings)
   // --------------------------------------------------------------------------
   THEMES: {

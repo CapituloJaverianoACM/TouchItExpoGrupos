@@ -38,7 +38,22 @@ window.Aetherward = window.Aetherward || {};
 
   class Spawner {
     constructor() {
+      this.symbolSet = 'rune'; // 'rune' (mouse/touch drawing) | 'gesture' (camera hand poses)
       this.reset('endless');
+    }
+
+    setSymbolSet(symbolSet) {
+      this.symbolSet = symbolSet === 'gesture' ? 'gesture' : 'rune';
+    }
+
+    _symbolIds(tiers) {
+      return Symbols.getSymbolsByTiers(tiers, this.symbolSet).map(s => s.id);
+    }
+
+    _easySymbolIds() {
+      return this.symbolSet === 'gesture'
+        ? this._symbolIds(['easy'])
+        : ['horizontal', 'vertical', 'v_down', 'v_up', 'circle', 'triangle'];
     }
 
     reset(gameMode = 'endless') {
@@ -152,20 +167,22 @@ window.Aetherward = window.Aetherward || {};
     pickSymbols(count, allowedTiers, isEarlyOnboarding = false) {
       if (isEarlyOnboarding) {
         // Gentle onboarding sequence in the first 12 seconds
-        const onboardingOrder = ['horizontal', 'vertical', 'v_down', 'circle', 'v_up', 'triangle'];
+        const onboardingOrder = this.symbolSet === 'gesture'
+          ? window.Aetherward.Gestures.ONBOARDING_ORDER
+          : ['horizontal', 'vertical', 'v_down', 'circle', 'v_up', 'triangle'];
         const sym = onboardingOrder[this.tutorialIndex % onboardingOrder.length];
         this.tutorialIndex++;
         return [sym];
       }
 
-      const pool = Symbols.getSymbolsByTiers(allowedTiers);
+      const pool = Symbols.getSymbolsByTiers(allowedTiers, this.symbolSet);
       const chosen = [];
       for (let i = 0; i < count; i++) {
         // Avoid duplicate symbols on the same enemy if possible
         const available = pool.filter(s => !chosen.includes(s.id));
         const pickFrom = available.length > 0 ? available : pool;
         const picked = this.randomChoice(pickFrom);
-        chosen.push(picked ? picked.id : 'horizontal');
+        chosen.push(picked ? picked.id : this._easySymbolIds()[0]);
       }
       return chosen;
     }
@@ -197,10 +214,8 @@ window.Aetherward = window.Aetherward || {};
       // Optional decoy symbol for Mirror Trickster
       let decoySymbol = null;
       if (arch.hasDecoyBalloon) {
-        const easyPool = Symbols.getSymbolsByTiers(['easy', 'medium'])
-          .map(s => s.id)
-          .filter(id => !symbols.includes(id));
-        decoySymbol = this.randomChoice(easyPool) || 'circle';
+        const easyPool = this._symbolIds(['easy', 'medium']).filter(id => !symbols.includes(id));
+        decoySymbol = this.randomChoice(easyPool) || this._easySymbolIds()[0];
       }
 
       // Choose horizontal spawn coordinate avoiding heavy overlap with recent spawns
@@ -241,7 +256,9 @@ window.Aetherward = window.Aetherward || {};
     spawnSplitChildren(parentEnemy, snapshot, canvasWidth, canvasHeight) {
       const children = [];
       const offsets = [-46, 46];
-      const easyPool = ['horizontal', 'vertical', 'v_down', 'v_up', 'circle'];
+      const easyPool = this.symbolSet === 'gesture'
+        ? this._easySymbolIds()
+        : ['horizontal', 'vertical', 'v_down', 'v_up', 'circle'];
 
       for (let i = 0; i < 2; i++) {
         const sym = this.randomChoice(easyPool);
@@ -274,7 +291,7 @@ window.Aetherward = window.Aetherward || {};
 
       const powerupKeys = Object.keys(CFG.POWERUPS.TYPES);
       const chosenPowerup = this.randomChoice(powerupKeys);
-      const easyRune = this.randomChoice(['horizontal', 'vertical', 'v_down', 'v_up', 'circle', 'triangle']);
+      const easyRune = this.randomChoice(this._easySymbolIds());
 
       const x = Math.max(70, Math.min(canvasWidth - 70, defeatedEnemy.x));
       const y = Math.max(80, defeatedEnemy.y);
