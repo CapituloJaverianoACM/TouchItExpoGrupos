@@ -26,17 +26,29 @@ window.Aetherward = window.Aetherward || {};
     return pts;
   }
 
-  function makeSpiralPoints(turns, inward, clockwise) {
+  function makeSpiralPoints(turns, inward, clockwise, startAngle = -Math.PI / 2) {
     const pts = [];
-    const steps = 48;
+    const steps = Math.max(48, Math.round(turns * 32));
     const dir = clockwise ? 1 : -1;
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
       const r = inward ? (0.48 * (1 - 0.82 * t)) : (0.08 + 0.40 * t);
-      const a = -Math.PI / 2 + dir * turns * Math.PI * 2 * t;
+      const a = startAngle + dir * turns * Math.PI * 2 * t;
       pts.push([0.5 + Math.cos(a) * r, 0.5 + Math.sin(a) * r]);
     }
     return pts;
+  }
+
+  function makeSpiralTemplateSet() {
+    const out = [];
+    for (const turns of [1.5, 2.1, 2.8]) {
+      for (let k = 0; k < 8; k++) {
+        const start = -Math.PI / 2 + (k * Math.PI) / 4;
+        out.push(makeSpiralPoints(turns, true, true, start));
+        out.push(makeSpiralPoints(turns, true, false, start));
+      }
+    }
+    return out;
   }
 
   function makeStarPoints(startIdx, reverse) {
@@ -210,12 +222,9 @@ window.Aetherward = window.Aetherward || {};
       scoreBonus: 1.35,
       hint: 'Swirl around at least 1.5 times (inward or outward).',
       displayPath: makeSpiralPoints(1.85, true, true),
-      templates: [
-        makeSpiralPoints(1.8, true, true),
-        makeSpiralPoints(1.8, true, false),
-        makeSpiralPoints(1.8, false, true),
-        makeSpiralPoints(1.8, false, false),
-      ]
+      // Inward spirals with varied turn counts, start angles and directions
+      // (outward spirals are covered by the recognizer's reversed-stroke matching)
+      templates: makeSpiralTemplateSet()
     },
 
     star: {

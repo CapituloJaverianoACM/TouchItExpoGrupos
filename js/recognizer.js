@@ -199,6 +199,18 @@ window.Aetherward = window.Aetherward || {};
       if (Math.abs(diff) > 0.85) sharpCorners++;
     }
 
+    // Net winding measured on a denser resample so small inner loops (spirals) aren't aliased
+    const dense = normalizePoints(resample(rawPoints, 128));
+    let windTurn = 0;
+    for (let i = 2; i < dense.length - 2; i += 2) {
+      const a1 = Math.atan2(dense[i][1] - dense[i - 2][1], dense[i][0] - dense[i - 2][0]);
+      const a2 = Math.atan2(dense[i + 2][1] - dense[i][1], dense[i + 2][0] - dense[i][0]);
+      let diff = a2 - a1;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      windTurn += diff;
+    }
+
     // Simplify normalized path to detect primary polygon vertices
     const simplified = simplifyRDP(normPoints, 0.11);
     const segmentCount = simplified.length - 1;
@@ -225,6 +237,7 @@ window.Aetherward = window.Aetherward || {};
       closureRatio,
       isClosed: closureRatio < 0.44,
       signedTurn,
+      windTurn,
       absTurn,
       sharpCorners,
       simplified,
@@ -245,11 +258,41 @@ window.Aetherward = window.Aetherward || {};
     for (const [id, sym] of Object.entries(Symbols.DEFINITIONS)) {
       compiledTemplates[id] = sym.templates.map(tpl => {
         const resampled = resample(tpl, n);
-        return normalizePoints(resampled);
+        const norm = normalizePoints(resampled);
+        // Closed templates (circle, triangle, square, star...) can be drawn starting from
+        // any point along the loop, so they are matched against every cyclic shift.
+        const isClosedLoop = !sym.directional && dist(norm[0], norm[n - 1]) < 0.06;
+        if (isClosedLoop) {
+          norm.loop = resample(norm, n).slice(0, n - 1);
+        }
+        return norm;
       });
     }
   }
   compileAllTemplates();
+
+  /**
+   * Best average point distance between a stroke and a closed-loop template,
+   * trying every starting point along the loop and both drawing directions.
+   */
+  function closedLoopDistance(normStroke, loop) {
+    const m = loop.length;
+    const len = normStroke.length;
+    let best = Infinity;
+    for (let shift = 0; shift < m; shift++) {
+      for (let dir = -1; dir <= 1; dir += 2) {
+        let sum = 0;
+        for (let i = 0; i < len; i++) {
+          const j = (((shift + dir * i) % m) + m) % m;
+          sum += dist(normStroke[i], loop[j]);
+          if (sum >= best * len) break;
+        }
+        const avg = sum / len;
+        if (avg < best) best = avg;
+      }
+    }
+    return best;
+  }
 
   /**
    * Computes template match similarity in [0..1] against a symbol's templates.
@@ -261,6 +304,13 @@ window.Aetherward = window.Aetherward || {};
     let bestDist = Infinity;
     for (let t = 0; t < templates.length; t++) {
       const tpl = templates[t];
+
+      if (tpl.loop) {
+        const d = closedLoopDistance(normStroke, tpl.loop);
+        if (d < bestDist) bestDist = d;
+        continue;
+      }
+
       // Forward match
       let sumF = 0;
       for (let i = 0; i < normStroke.length; i++) {
@@ -338,7 +388,7 @@ window.Aetherward = window.Aetherward || {};
 
       case 'circle': {
         if (f.straightness > 0.65) return -0.5;
-        const turns = Math.abs(f.signedTurn) / (Math.PI * 2);
+        const turns = Math.abs(f.windTurn) / (Math.PI * 2);
         // Must be roughly 1 full loop (not 1.6+ turns which is a spiral)
         if (turns >= 0.68 && turns <= 1.38 && f.closureRatio < 0.52) {
           if (f.sharpCorners >= 3) return -0.18; // Polygon with sharp corners
@@ -394,16 +444,23 @@ window.Aetherward = window.Aetherward || {};
       }
 
       case 'spiral': {
-        const turns = Math.abs(f.signedTurn) / (Math.PI * 2);
-        if (turns >= 1.38) return 0.34;
-        if (f.absTurn / (Math.PI * 2) >= 1.55 && !f.isClosed) return 0.22;
+        // A star also winds ~2 full turns, but through sharp corners and self-crossings;
+        // a spiral winds smoothly and never crosses itself.
+        // (tight inner loops register as "sharp corners", so crossings are the reliable cue)
+        if (f.intersections >= 3) return -0.35;
+        const turns = Math.abs(f.windTurn) / (Math.PI * 2);
+        if (turns >= 1.38 && f.intersections <= 1) return 0.34;
+        if (turns >= 1.25 && f.intersections <= 2) return 0.18;
         return -0.35;
       }
 
       case 'star': {
-        if (f.segmentCount >= 4 && (f.intersections >= 2 || f.sharpCorners >= 3)) {
-          return 0.28;
+        // A pentagram crosses itself 5 times; spirals and zigzags never do
+        if (f.intersections <= 1) return -0.3;
+        if (f.segmentCount >= 4 && f.intersections >= 3 && f.sharpCorners >= 3) {
+          return 0.32;
         }
+        if (f.segmentCount >= 4) return 0.16;
         return -0.2;
       }
 
@@ -468,7 +525,9 @@ window.Aetherward = window.Aetherward || {};
       }
 
       case 'omega': {
-        // Starts and ends low (y > 0.60), arches high in the middle (y < 0.30), no self-intersection
+        // Starts and ends low (y > 0.60), arches high in the middle (y < 0.30), no self-intersection.
+        // The rounded dome + feet turn far more than a plain '^' chevron (which has only 2 segments).
+        if (f.segmentCount <= 3 || f.absTurn < Math.PI * 2 * 0.85) return -0.25;
         if (start[1] > 0.60 && end[1] > 0.60 && mid[1] < 0.30 && !f.isClosed && f.intersections === 0) {
           return 0.28;
         }
