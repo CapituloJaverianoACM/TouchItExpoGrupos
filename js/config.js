@@ -315,6 +315,8 @@ window.Aetherward.CONFIG = {
     TOUCH_FORGIVENESS_BONUS: 0.07,// Extra tolerance when using touch input or lenient setting
     ACTIVE_ON_SCREEN_BOOST: 0.14, // Boosts confidence for symbols currently visible on balloons
     MULTI_STROKE_WINDOW_MS: 420,  // Grace period when drawing 2-stroke runes (e.g., '+' Cross)
+    CAMERA_FORGIVENESS_BONUS: 0.05,       // Extra tolerance for air-drawn (webcam) strokes
+    CAMERA_MULTI_STROKE_WINDOW_MS: 1800,  // Fist close + reopen between strokes takes far longer than a pen lift
   },
 
   // --------------------------------------------------------------------------

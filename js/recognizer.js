@@ -501,8 +501,12 @@ window.Aetherward = window.Aetherward || {};
       const {
         activeSymbols = new Set(),
         isTouch = false,
+        isCamera = false,
         extraForgiving = false,
       } = options;
+      const multiStrokeWindow = isCamera
+        ? CFG.CAMERA_MULTI_STROKE_WINDOW_MS
+        : CFG.MULTI_STROKE_WINDOW_MS;
 
       if (!rawPoints || rawPoints.length < CFG.MIN_POINTS) {
         return { symbolId: null, confidence: 0, candidates: [], tooShort: true };
@@ -519,7 +523,7 @@ window.Aetherward = window.Aetherward || {};
       if (
         this.previousStroke &&
         (activeSymbols.size === 0 || activeSymbols.has('cross_rune')) &&
-        now - this.previousStroke.timestamp <= CFG.MULTI_STROKE_WINDOW_MS
+        now - this.previousStroke.timestamp <= multiStrokeWindow
       ) {
         const prev = this.previousStroke;
         const currResampled = resample(rawPoints, CFG.RESAMPLE_POINTS);
@@ -578,6 +582,7 @@ window.Aetherward = window.Aetherward || {};
       // Determine threshold based on input type & settings
       let threshold = CFG.BASE_MATCH_THRESHOLD;
       if (isTouch) threshold -= CFG.TOUCH_FORGIVENESS_BONUS;
+      if (isCamera) threshold -= CFG.CAMERA_FORGIVENESS_BONUS;
       if (extraForgiving) threshold -= 0.06;
 
       const matchedId = best && best.score >= threshold ? best.symbolId : null;

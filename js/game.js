@@ -30,7 +30,7 @@ window.Aetherward = window.Aetherward || {};
       // Connect Camera air-drawing strokes to the main Gesture Recognizer
       this.camera.onAirStrokeCompleted = strokePoints => {
         if (this.state === 'playing') {
-          this._evaluateDrawnStroke(strokePoints, true);
+          this._evaluateDrawnStroke(strokePoints, true, true);
         }
       };
 
@@ -351,11 +351,12 @@ window.Aetherward = window.Aetherward || {};
       return set;
     }
 
-    _evaluateDrawnStroke(points, isTouch) {
+    _evaluateDrawnStroke(points, isTouch, isCamera = false) {
       const activeSymbols = this._getActiveSymbolSet();
       const result = this.recognizer.recognize(points, {
         activeSymbols,
         isTouch,
+        isCamera,
         extraForgiving: this.extraForgiving
       });
 
